@@ -2,7 +2,7 @@ use waapi_rs::WaapiClient;
 
 #[tokio::test]
 async fn test_waapi_get_info() {
-    let mut client = WaapiClient::connect()
+    let client = WaapiClient::connect()
         .await
         .expect("Failed to connect");
 

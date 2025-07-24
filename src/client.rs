@@ -36,7 +36,7 @@ impl WaapiClient {
     }
 
     pub async fn call(
-        &mut self,
+        &self,
         uri: &str,
         args: Option<Vec<Value>>,
         kwargs: Option<Map<String, Value>>,
