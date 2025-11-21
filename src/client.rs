@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use wamp_async::{Client, ClientConfig, SerializerType, WampDict, WampError, WampKwArgs};
 
 const DEFAULT_WAAPI_URL: &str = "ws://localhost:8080/waapi";
@@ -93,21 +91,26 @@ impl WaapiClient {
 
 impl Drop for WaapiClient {
     fn drop(&mut self) {
-        if self.client.is_some() {
+        if self.client.is_some() || self.event_loop_handle.is_some() {
             // 尝试在当前运行时中清理
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                let mut client = self.client.take();
-                let mut event_loop = self.event_loop_handle.take();
+                let client = self.client.take();
+                let event_loop = self.event_loop_handle.take();
                 
                 handle.spawn(async move {
-                    if let Some(mut c) = client.take() {
+                    if let Some(mut c) = client {
                         let _ = c.leave_realm().await;
                         c.disconnect().await;
                     }
-                    if let Some(h) = event_loop.take() {
+                    if let Some(h) = event_loop {
                         h.abort();
                     }
                 });
+            } else {
+                // 如果没有运行时，至少abort event loop handle
+                if let Some(h) = self.event_loop_handle.take() {
+                    h.abort();
+                }
             }
         }
     }
@@ -120,7 +123,7 @@ impl Drop for WaapiClient {
 /// 客户端在 Drop 时会自动清理资源。
 pub struct WaapiClientSync {
     runtime: tokio::runtime::Runtime,
-    client: Arc<Mutex<Option<WaapiClient>>>,
+    client: Option<WaapiClient>,
 }
 
 impl WaapiClientSync {
@@ -141,7 +144,7 @@ impl WaapiClientSync {
 
         Ok(Self {
             runtime,
-            client: Arc::new(Mutex::new(Some(client))),
+            client: Some(client),
         })
     }
 
@@ -158,43 +161,29 @@ impl WaapiClientSync {
         args: Option<WampKwArgs>,
         options: Option<WampDict>,
     ) -> Result<Option<WampKwArgs>, Box<dyn std::error::Error>> {
-        self.runtime.block_on(async {
-            let client_guard = self.client.lock().await;
-            let client = client_guard
-                .as_ref()
-                .ok_or("Client already disconnected")?;
-            client.call(uri, args, options).await
-        })
+        let client = self.client.as_ref().ok_or("Client already disconnected")?;
+        self.runtime.block_on(client.call(uri, args, options))
     }
 
     /// 检查客户端是否已连接
     pub fn is_connected(&self) -> bool {
-        self.runtime.block_on(async {
-            let client_guard = self.client.lock().await;
-            client_guard.as_ref().map_or(false, |c| c.is_connected())
-        })
+        self.client.as_ref().map_or(false, |c| c.is_connected())
     }
 
     /// 显式断开连接
     /// 
     /// 注意：即使不调用此方法，Drop 时也会自动断开
-    pub fn disconnect(self) {
-        self.runtime.block_on(async {
-            let mut client_guard = self.client.lock().await;
-            if let Some(client) = client_guard.take() {
-                client.disconnect().await;
-            }
-        });
+    pub fn disconnect(mut self) {
+        if let Some(client) = self.client.take() {
+            self.runtime.block_on(client.disconnect());
+        }
     }
 }
 
 impl Drop for WaapiClientSync {
     fn drop(&mut self) {
-        self.runtime.block_on(async {
-            let mut client_guard = self.client.lock().await;
-            if let Some(client) = client_guard.take() {
-                client.disconnect().await;
-            }
-        });
+        if let Some(client) = self.client.take() {
+            self.runtime.block_on(client.disconnect());
+        }
     }
 }
