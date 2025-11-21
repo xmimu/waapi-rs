@@ -1,16 +1,14 @@
-use waapi_rs::WaapiClient;
+use waapi_rs::WaapiClientSync;
 
-#[tokio::test]
-async fn test_waapi_get_info() {
-    // 建立连接
-    let client = WaapiClient::connect()
-        .await
+#[test]
+fn test_waapi_get_info_sync() {
+    // 建立连接 - 不需要 tokio::test 宏
+    let client = WaapiClientSync::connect()
         .expect("Failed to connect to WAAPI");
 
-    // 调用 getInfo 接口
+    // 同步调用 getInfo 接口
     let result = client
         .call("ak.wwise.core.getInfo", None, None)
-        .await
         .expect("WAAPI call failed");
 
     // 验证返回结果
@@ -26,5 +24,5 @@ async fn test_waapi_get_info() {
     }
 
     // 断开连接
-    client.disconnect().await;
+    client.disconnect();
 }

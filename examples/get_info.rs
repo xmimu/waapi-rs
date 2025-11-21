@@ -6,12 +6,12 @@ async fn main() {
         .await
         .expect("Failed to connect");
 
-    let (_, kwargs) = client
+    let result = client
         .call("ak.wwise.core.getInfo", None, None)
         .await
         .expect("WAAPI call failed");
 
-    if let Some(map) = kwargs {
+    if let Some(map) = result {
         let version = map
             .get("version")
             .and_then(|v| v.get("displayName"))

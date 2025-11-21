@@ -1373,9 +1373,8 @@ dependencies = [
 
 [[package]]
 name = "wamp_async"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fda124152e460957ae105f2469832eabbfbc48bb901a5657f8f6ad84cf4d8d1"
+version = "0.3.2-alpha.0"
+source = "git+https://github.com/xmimu/wamp_async.git?branch=dev#fc7f97a5e1e199394e814b79c8e3d6f54f589410"
 dependencies = [
  "async-trait",
  "futures",
