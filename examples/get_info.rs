@@ -1,3 +1,9 @@
+//! 获取 Wwise 版本示例：调用 `ak.wwise.core.getInfo` 并打印版本信息。
+//!
+//! 运行前提：Wwise 已启动，且工程中已启用 Authoring API（Project > User Preferences > Enable Wwise Authoring API）。
+//!
+//! 运行方式：`cargo run --example get_info`
+
 use waapi_rs::WaapiClient;
 
 #[tokio::main]

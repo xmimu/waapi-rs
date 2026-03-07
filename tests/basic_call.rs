@@ -1,11 +1,18 @@
+//! 异步 WAAPI 调用测试：连接、调用 `ak.wwise.core.getInfo`、校验返回、断开。
+//!
+//! 运行方式：`cargo test`。若本机未运行 Wwise 或未启用 Authoring API，测试会自动跳过（eprintln + return）。
+
 use waapi_rs::WaapiClient;
 
 #[tokio::test]
 async fn test_waapi_get_info() {
-    // 建立连接
-    let client = WaapiClient::connect()
-        .await
-        .expect("Failed to connect to WAAPI");
+    let client = match WaapiClient::connect().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Skip: WAAPI not available ({})", e);
+            return;
+        }
+    };
 
     // 调用 getInfo 接口
     let result = client

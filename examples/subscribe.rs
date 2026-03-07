@@ -1,5 +1,8 @@
 //! 订阅示例：对应 Python waapi-client 的 subscribe 用法
 //!
+//! 运行方式：`cargo run --example subscribe`
+//! 运行前提：Wwise 已启动并启用 Authoring API；运行后可在 Wwise 中切换选中对象以触发回调。
+//!
 //! Python 参考：
 //!   https://github.com/audiokinetic/waapi-client-python
 //!

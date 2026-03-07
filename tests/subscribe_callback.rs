@@ -2,6 +2,7 @@
 //!
 //! 参考：https://github.com/audiokinetic/waapi-client-python
 //! 需要本机开启 Wwise 并启用 Authoring API。
+//! 运行方式：`cargo test`；若未开 Wwise 则部分测试会 skip。
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;

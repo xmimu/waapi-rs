@@ -1,7 +1,8 @@
 //! 订阅测试：对应 Python 的 client.subscribe(topic, callback) / handler.unsubscribe()
 //!
 //! 参考：https://github.com/audiokinetic/waapi-client-python
-//! 需要本机开启 Wwise 并启用 Authoring API (Project > User Preferences... > Enable Wwise Authoring API)
+//! 需要本机开启 Wwise 并启用 Authoring API (Project > User Preferences... > Enable Wwise Authoring API)。
+//! 运行方式：`cargo test`；若未开 Wwise 则部分测试会 skip。
 
 use std::time::Duration;
 use tokio::time::timeout;
