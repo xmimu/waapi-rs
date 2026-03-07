@@ -4,7 +4,7 @@
 
 - **定位**：waapi-rs 是 Wwise Authoring API (WAAPI) 的 Rust 客户端，通过 WAMP 协议与 Wwise 编辑器通信。
 - **目标用户**：需要在 Rust 中调用 WAAPI 的开发者（工具链、自动化、插件等）。
-- **范围**：提供连接、RPC 调用 (call)、主题订阅 (subscribe) 及资源清理；不覆盖 WAAPI 的全部高级特性，仅支持当前使用的 WAMP 子集（JSON 序列化、默认 realm 等）。
+- **范围**：提供连接、RPC 调用 (call)、主题订阅 (subscribe)、WAAPI URI 常量（`ak::*`）及资源清理；不覆盖 WAAPI 的全部高级特性，仅支持当前使用的 WAMP 子集（JSON 序列化、默认 realm 等）。
 
 ## 依赖与协议
 
@@ -41,6 +41,11 @@ flowchart LR
 | **SubscriptionHandle** | 持有订阅 ID、与 client 共享的 `Arc`、以及可选的 `recv_task`（`subscribe_with_callback` 时存在）；`unsubscribe()` 显式取消，`Drop` 时也会在后台 spawn 异步取消，避免阻塞。 |
 | **SubscriptionHandleSync** | 用于取消同步客户端创建的订阅；`unsubscribe()` 或 drop 时取消订阅并 join 桥接线程；禁止在回调内部 drop，否则可能死锁。 |
 
+## RPC 与 URI 常量
+
+- **call 泛型**：`call<T>(uri, args, options)`、`call_no_args<T>(uri)` 的泛型 `T` 表示**返回值**的反序列化类型，需满足 `Serialize + DeserializeOwned`（如 `serde_json::Value` 或自定义结构体）。返回 `Result<Option<T>, Error>`：成功时 WAAPI 的 kwargs 反序列化为 `T`，无结果时为 `None`；args/options 仍为可序列化类型（通常 `Value` 或 `impl Serialize`）。
+- **URI 常量（uris）**：`src/uris.rs` 中按 WAAPI URI 路径组织嵌套模块（`ak::soundengine`、`ak::wwise::core`、`ak::wwise::debug`、`ak::wwise::ui`、`ak::wwise::waapi`），每层提供 `pub const XXX: &str = "ak.xxx.xxx"`。库通过 `pub use uris::ak` 重导出，用户只需 `use waapi_rs::ak`，调用时从 `ak::` 写路径（如 `ak::wwise::core::GET_INFO`），与 C++ WAAPI / 官方 URI 命名一致，便于补全与避免手写字符串。
+
 ## 订阅模型
 
 - **`subscribe(topic)`**：返回 `(SubscriptionHandle, UnboundedReceiver<SubscribeEvent>)`。调用方需在单独 task 中消费 receiver；背压由 unbounded channel 缓冲。取消方式：调用 `handle.unsubscribe()` 或 drop handle。
@@ -64,8 +69,8 @@ flowchart LR
 | Python (waapi-client-python) | waapi-rs |
 |------------------------------|----------|
 | `WaapiClient()` / `connect()` | `WaapiClient::connect().await` 或 `WaapiClientSync::connect()` |
-| `client.call(uri, options=...)` | `client.call(uri, args, options)` 或 `call_no_args(uri)` |
-| `client.subscribe(topic, callback)` | `subscribe_with_callback(topic, \|args, kwargs\| { ... })` 或 `subscribe(topic)` + 自行消费 receiver |
+| `client.call(uri, options=...)` | `client.call::<T>(uri, args, options)` 或 `call_no_args::<T>(uri)`，泛型 `T` 为返回值类型，返回 `Result<Option<T>, Error>`；URI 可用常量如 `ak::wwise::core::GET_INFO` |
+| `client.subscribe(topic, callback)` | `subscribe_with_callback(topic, \|args, kwargs\| { ... })` 或 `subscribe(topic)` + 自行消费 receiver；主题可用 `ak::wwise::ui::SELECTION_CHANGED` 等 |
 | `handler.unsubscribe()` | `handle.unsubscribe().await` 或 drop `SubscriptionHandle` |
 | `client.disconnect()` | `client.disconnect().await` 或 drop `WaapiClient` |
 
@@ -73,6 +78,6 @@ flowchart LR
 
 ## 未来可扩展方向（可选）
 
-- 更多 WAAPI 封装（如常用 URI 常量或类型化接口）。
+- 常用 WAAPI URI 已以 `ak::*` 常量形式提供；可进一步做类型化封装（如按 URI 的 schema 生成请求/响应结构体）。
 - 可配置 SSL 校验与 realm。
 - 重连策略与连接状态回调。
