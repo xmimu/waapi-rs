@@ -95,16 +95,15 @@
 //! }
 //! ```
 //!
-//! # Re-exports 与 call 约束
+//! # call 约束
 //!
-//! 从 `wamp_async` 重新导出：`WampArgs`、`WampDict`、`WampId`、`WampKwArgs`，用于订阅事件等。
-//! `call` 的入参与返回值统一为 `T: Serialize + DeserializeOwned`（如 `serde_json::Value`、`HashMap`、自定义结构体），返回 `Option<T>`。
+//! `call` 的入参与返回值统一为 `T: Serialize + DeserializeOwned`（如 `serde_json::Value`、自定义结构体），返回 `Option<T>`。
 
 mod args;
 mod client;
-pub mod uris;
+mod uris;
+pub use uris::ak;
 
 pub use client::{
     SubscribeEvent, SubscriptionHandle, SubscriptionHandleSync, WaapiClient, WaapiClientSync,
 };
-pub use wamp_async::{WampArgs, WampDict, WampId, WampKwArgs};

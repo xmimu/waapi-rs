@@ -3,9 +3,8 @@
 //! 需要本机开启 Wwise 并启用 Authoring API。运行方式：`cargo test`；若未开 Wwise 则 skip。
 
 use std::time::Duration;
+use waapi_rs::ak;
 use waapi_rs::{SubscribeEvent, WaapiClientSync};
-
-const TOPIC_SELECTION_CHANGED: &str = "ak.wwise.ui.selectionChanged";
 
 #[test]
 fn test_sync_subscribe_and_unsubscribe() {
@@ -17,7 +16,7 @@ fn test_sync_subscribe_and_unsubscribe() {
         }
     };
 
-    let (handle, rx) = match client.subscribe(TOPIC_SELECTION_CHANGED) {
+    let (handle, rx) = match client.subscribe(ak::wwise::ui::SELECTION_CHANGED) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("Skip: subscribe failed ({})", e);
@@ -42,7 +41,7 @@ fn test_sync_subscribe_with_callback() {
         }
     };
 
-    let handle = match client.subscribe_with_callback(TOPIC_SELECTION_CHANGED, |_args, _kwargs| {}) {
+    let handle = match client.subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, _kwargs| {}) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("Skip: subscribe_with_callback failed ({})", e);

@@ -6,9 +6,8 @@
 
 use std::time::Duration;
 use tokio::time::timeout;
+use waapi_rs::ak::wwise::ui::SELECTION_CHANGED;
 use waapi_rs::{SubscribeEvent, WaapiClient};
-
-const TOPIC_SELECTION_CHANGED: &str = "ak.wwise.ui.selectionChanged";
 
 #[tokio::test]
 async fn test_subscribe_and_unsubscribe() {
@@ -22,7 +21,7 @@ async fn test_subscribe_and_unsubscribe() {
 
     // 对应 Python: handler = client.subscribe("ak.wwise.ui.selectionChanged", ...)
     let (handle, mut rx) = client
-        .subscribe(TOPIC_SELECTION_CHANGED)
+        .subscribe(SELECTION_CHANGED)
         .await
         .expect("subscribe failed");
 
@@ -46,7 +45,7 @@ async fn test_subscribe_receiver_dropped_then_unsubscribe() {
         }
     };
 
-    let (handle, rx) = match client.subscribe(TOPIC_SELECTION_CHANGED).await {
+    let (handle, rx) = match client.subscribe(SELECTION_CHANGED).await {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("Skip: subscribe failed ({})", e);

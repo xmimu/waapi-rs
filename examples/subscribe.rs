@@ -18,9 +18,8 @@
 //! ```
 
 use std::time::Duration;
+use waapi_rs::ak;
 use waapi_rs::WaapiClient;
-
-const TOPIC_SELECTION_CHANGED: &str = "ak.wwise.ui.selectionChanged";
 
 #[tokio::main]
 async fn main() {
@@ -30,9 +29,12 @@ async fn main() {
         .expect("Failed to connect to WAAPI. Ensure Wwise is running with Authoring API enabled.");
 
     // 方式一：subscribe_with_callback —— 对应 Python 的 subscribe(topic, lambda obj: ...)
-    println!("Subscribing to {} with callback...", TOPIC_SELECTION_CHANGED);
+    println!(
+        "Subscribing to {} with callback...",
+        ak::wwise::ui::SELECTION_CHANGED
+    );
     let handler = client
-        .subscribe_with_callback(TOPIC_SELECTION_CHANGED, |_args, kwargs| {
+        .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, kwargs| {
             println!("Selection changed: {:?}", kwargs);
         })
         .await

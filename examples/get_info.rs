@@ -5,7 +5,7 @@
 //! 运行方式：`cargo run --example get_info`
 
 use serde_json::Value;
-use waapi_rs::{uris::ak::wwise::core, WaapiClient};
+use waapi_rs::{ak::wwise::core, WaapiClient};
 
 #[tokio::main]
 async fn main() {

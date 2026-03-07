@@ -1,5 +1,5 @@
 use serde_json::Value;
-use waapi_rs::{uris::ak, WaapiClient};
+use waapi_rs::{ak, WaapiClient};
 
 #[tokio::main]
 async fn main() {

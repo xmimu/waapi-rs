@@ -4,7 +4,7 @@
 //! 配合 WAQL 语句获取指定类型的 Wwise 对象（此处为 Event 类型）。
 
 use serde_json::json;
-use waapi_rs::{uris::ak, WaapiClient};
+use waapi_rs::{ak, WaapiClient};
 
 #[tokio::main]
 async fn main() {

@@ -8,9 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
+use waapi_rs::ak;
 use waapi_rs::WaapiClient;
-
-const TOPIC_SELECTION_CHANGED: &str = "ak.wwise.ui.selectionChanged";
 
 #[tokio::test]
 async fn test_subscribe_with_callback() {
@@ -26,7 +25,7 @@ async fn test_subscribe_with_callback() {
     let count = Arc::new(AtomicU32::new(0));
     let count_clone = Arc::clone(&count);
     let handler = client
-        .subscribe_with_callback(TOPIC_SELECTION_CHANGED, move |_args, kwargs| {
+        .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, move |_args, kwargs| {
             count_clone.fetch_add(1, Ordering::Relaxed);
             println!("[test] selectionChanged: {:?}", kwargs);
         })
@@ -59,7 +58,7 @@ async fn test_subscribe_callback_drop_handle() {
     };
 
     let handler = client
-        .subscribe_with_callback(TOPIC_SELECTION_CHANGED, |_args, kwargs| {
+        .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, kwargs| {
             println!("[test] selectionChanged (drop_handle): {:?}", kwargs);
         })
         .await
