@@ -2,6 +2,7 @@
 //!
 //! 运行方式：`cargo test`。若本机未运行 Wwise 或未启用 Authoring API，测试会自动跳过（eprintln + return）。
 
+use serde_json::Value;
 use waapi_rs::WaapiClient;
 
 #[tokio::test]
@@ -16,14 +17,14 @@ async fn test_waapi_get_info() {
 
     // 调用 getInfo 接口
     let result = client
-        .call("ak.wwise.core.getInfo", None, None)
+        .call_no_args::<Value>("ak.wwise.core.getInfo")
         .await
         .expect("WAAPI call failed");
 
-    // 验证返回结果
+    // 验证返回结果（result 为 Option<Value>）
     let info = result.expect("Expected response to contain kwargs");
     assert!(
-        info.contains_key("version"),
+        info.get("version").is_some(),
         "Response should contain 'version' field"
     );
 

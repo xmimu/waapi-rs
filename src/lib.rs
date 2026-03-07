@@ -15,18 +15,43 @@
 //! 异步客户端：连接后调用 WAAPI 方法（如获取 Wwise 版本）：
 //!
 //! ```rust,no_run
+//! use serde_json::Value;
 //! use waapi_rs::WaapiClient;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClient::connect().await?;
-//!     let result = client.call("ak.wwise.core.getInfo", None, None).await?;
+//!     let result = client.call_no_args::<Value>("ak.wwise.core.getInfo").await?;
 //!     if let Some(info) = result {
 //!         let version = info.get("version")
 //!             .and_then(|v| v.get("displayName"))
 //!             .and_then(|v| v.as_str())
 //!             .unwrap_or("Unknown");
 //!         println!("Wwise Version: {}", version);
+//!     }
+//!     client.disconnect().await;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! 使用 `json!` 构造参数与选项进行 RPC 调用（如 WAQL 查询）：
+//!
+//! ```rust,no_run
+//! use serde_json::{json, Value};
+//! use waapi_rs::WaapiClient;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let client = WaapiClient::connect().await?;
+//!     let result = client
+//!         .call::<Value>(
+//!             "ak.wwise.core.object.get",
+//!             Some(json!({ "waql": "$ from type Event" })),
+//!             Some(json!({ "return": ["id", "name", "type"] })),
+//!         )
+//!         .await?;
+//!     if let Some(obj) = result {
+//!         println!("Objects: {:?}", obj);
 //!     }
 //!     client.disconnect().await;
 //!     Ok(())
@@ -56,11 +81,12 @@
 //! 同步客户端（适用于非 async 代码或脚本）：
 //!
 //! ```rust,no_run
+//! use serde_json::Value;
 //! use waapi_rs::WaapiClientSync;
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClientSync::connect()?;
-//!     let result = client.call_no_args("ak.wwise.core.getInfo")?;
+//!     let result = client.call_no_args::<Value>("ak.wwise.core.getInfo")?;
 //!     if let Some(info) = result {
 //!         println!("Info: {:?}", info);
 //!     }
@@ -69,12 +95,14 @@
 //! }
 //! ```
 //!
-//! # Re-exports（与 WAAPI 参数/返回值交互）
+//! # Re-exports 与 call 约束
 //!
-//! 从 `wamp_async` 重新导出：`WampArgs`（位置参数）、`WampDict`（字典）、`WampId`（ID）、
-//! `WampKwArgs`（关键字参数），用于 `call` 的入参与返回值、以及订阅事件的 `args`/`kwargs`。
+//! 从 `wamp_async` 重新导出：`WampArgs`、`WampDict`、`WampId`、`WampKwArgs`，用于订阅事件等。
+//! `call` 的入参与返回值统一为 `T: Serialize + DeserializeOwned`（如 `serde_json::Value`、`HashMap`、自定义结构体），返回 `Option<T>`。
 
+mod args;
 mod client;
+pub mod uris;
 
 pub use client::{
     SubscribeEvent, SubscriptionHandle, SubscriptionHandleSync, WaapiClient, WaapiClientSync,

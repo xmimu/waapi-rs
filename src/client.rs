@@ -8,7 +8,11 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread;
 use tokio::sync::Mutex as TokioMutex;
-use wamp_async::{Client, ClientConfig, SerializerType, WampDict, WampError, WampId, WampKwArgs};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use wamp_async::{Client, ClientConfig, SerializerType, WampError, WampId, WampKwArgs};
+
+use crate::args::{value_to_kwargs, value_to_wamp_dict, wamp_result_to_value};
 
 /// 默认 WAAPI WebSocket 地址（Wwise 本机 Authoring API 默认端口）。
 const DEFAULT_WAAPI_URL: &str = "ws://localhost:8080/waapi";
@@ -80,14 +84,29 @@ impl WaapiClient {
     /// # 参数
     ///
     /// * `uri` - WAAPI 方法的 URI，如 "ak.wwise.core.getInfo"
-    /// * `args` - 可选的关键字参数
-    /// * `options` - 可选的选项字典
-    pub async fn call(
+    /// * `args` - 可选的关键字参数（`T: Serialize + DeserializeOwned`，如 `json!` 或带 `#[derive(Serialize, Deserialize)]` 的结构体）
+    /// * `options` - 可选的选项字典（与 `args` 同类型 `T`）
+    ///
+    /// 返回 `Option<T>`，与入参类型一致。
+    pub async fn call<T>(
         &self,
         uri: &str,
-        args: Option<WampKwArgs>,
-        options: Option<WampDict>,
-    ) -> Result<Option<WampKwArgs>, Box<dyn std::error::Error>> {
+        args: Option<T>,
+        options: Option<T>,
+    ) -> Result<Option<T>, Box<dyn std::error::Error>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        let args = args
+            .map(serde_json::to_value)
+            .transpose()?
+            .map(value_to_kwargs)
+            .transpose()?;
+        let options = options
+            .map(serde_json::to_value)
+            .transpose()?
+            .map(value_to_wamp_dict)
+            .transpose()?;
         let client = self
             .client
             .as_ref()
@@ -99,12 +118,20 @@ impl WaapiClient {
             .ok_or("Client already disconnected")?
             .call(uri, None, args, options)
             .await?;
-        Ok(result)
+        let out = result
+            .map(wamp_result_to_value)
+            .transpose()?
+            .map(serde_json::from_value)
+            .transpose()?;
+        Ok(out)
     }
 
-    /// 无参便捷调用，等价于 `call(uri, None, None)`
-    pub async fn call_no_args(&self, uri: &str) -> Result<Option<WampKwArgs>, Box<dyn std::error::Error>> {
-        self.call(uri, None, None).await
+    /// 无参便捷调用，等价于 `call(uri, None, None)`；返回类型由泛型指定，如 `call_no_args::<serde_json::Value>(uri)`。
+    pub async fn call_no_args<T>(&self, uri: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        self.call::<T>(uri, None, None).await
     }
 
     /// 订阅主题，返回事件流与句柄。
@@ -380,22 +407,30 @@ impl WaapiClientSync {
     /// # 参数
     ///
     /// * `uri` - WAAPI 方法的 URI，如 "ak.wwise.core.getInfo"
-    /// * `args` - 可选的关键字参数
-    /// * `options` - 可选的选项字典
-    pub fn call(
+    /// * `args` - 可选的关键字参数（`T: Serialize + DeserializeOwned`）
+    /// * `options` - 可选的选项字典（与 `args` 同类型 `T`）
+    ///
+    /// 返回 `Option<T>`，与入参类型一致。
+    pub fn call<T>(
         &self,
         uri: &str,
-        args: Option<WampKwArgs>,
-        options: Option<WampDict>,
-    ) -> Result<Option<WampKwArgs>, Box<dyn std::error::Error>> {
+        args: Option<T>,
+        options: Option<T>,
+    ) -> Result<Option<T>, Box<dyn std::error::Error>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
         let client = self.client.as_ref().ok_or("Client already disconnected")?;
         self.runtime
             .block_on(client.call(uri, args, options))
     }
 
-    /// 无参便捷调用，等价于 `call(uri, None, None)`
-    pub fn call_no_args(&self, uri: &str) -> Result<Option<WampKwArgs>, Box<dyn std::error::Error>> {
-        self.call(uri, None, None)
+    /// 无参便捷调用，等价于 `call(uri, None, None)`；返回类型由泛型指定，如 `call_no_args::<serde_json::Value>(uri)`。
+    pub fn call_no_args<T>(&self, uri: &str) -> Result<Option<T>, Box<dyn std::error::Error>>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        self.call::<T>(uri, None, None)
     }
 
     /// 订阅主题，返回同步句柄与同步 channel 的 receiver；从 receiver 上 `recv()` 或 `recv_timeout()` 收取事件。
