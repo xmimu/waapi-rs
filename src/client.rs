@@ -1,3 +1,12 @@
+//! WAAPI client implementation: async [WaapiClient] and sync [WaapiClientSync].
+//!
+//! Connection lifecycle: after `connect`, joins the default realm; on disconnect,
+//! all subscriptions are cancelled first, then `leave_realm`, then `disconnect`.
+//! Subscriptions are managed via [SubscriptionHandle]; explicit [SubscriptionHandle::unsubscribe]
+//! or drop will cancel automatically. For sync clients, [SubscriptionHandleSync] is used.
+//!
+//! ---
+//!
 //! WAAPI 客户端实现：异步 [WaapiClient] 与同步 [WaapiClientSync]。
 //!
 //! 连接生命周期：`connect` 后加入默认 realm，断开时先取消所有订阅、再 leave_realm、再 disconnect。
@@ -17,34 +26,69 @@ use log::{debug, info, warn};
 
 use crate::args::{value_to_kwargs, value_to_wamp_dict, wamp_result_to_value};
 
+/// Default WAAPI WebSocket URL (default port for Wwise local Authoring API).
+///
+/// ---
+///
 /// 默认 WAAPI WebSocket 地址（Wwise 本机 Authoring API 默认端口）。
 const DEFAULT_WAAPI_URL: &str = "ws://localhost:8080/waapi";
 
+/// Default WAMP realm name, matching the Wwise WAAPI server default.
+///
+/// ---
+///
 /// 连接时使用的默认 WAMP realm 名称，与 Wwise WAAPI 服务端默认一致。
 const DEFAULT_REALM: &str = "realm1";
 
-/// WAAPI 客户端错误类型
+/// WAAPI client error type.
+///
+/// ---
+///
+/// WAAPI 客户端错误类型。
 #[derive(Debug, thiserror::Error)]
 pub enum WaapiError {
-    /// 客户端已断开连接
+    /// Client already disconnected.
+    ///
+    /// 客户端已断开连接。
     #[error("client already disconnected")]
     Disconnected,
-    /// WAMP 协议层错误
+    /// WAMP protocol error.
+    ///
+    /// WAMP 协议层错误。
     #[error("{0}")]
     Wamp(#[from] WampError),
-    /// 序列化/反序列化错误
+    /// Serialization / deserialization error.
+    ///
+    /// 序列化/反序列化错误。
     #[error("{0}")]
     Serde(#[from] serde_json::Error),
-    /// IO 错误（如 tokio runtime 创建失败）
+    /// IO error (e.g. failed to create tokio runtime).
+    ///
+    /// IO 错误（如 tokio runtime 创建失败）。
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
 
+/// Subscription event payload: `(PublicationId, args, kwargs)`.
+///
+/// Received from a receiver or callback; typically parse event content from
+/// `args` / `kwargs`. `PublicationId` can be used for deduplication or logging.
+///
+/// ---
+///
 /// 订阅事件 payload：`(PublicationId, args, kwargs)`。
 ///
 /// 从 receiver 或回调中收到；通常使用 `args` / `kwargs` 解析事件内容，PublicationId 可用于去重或日志。
 pub type SubscribeEvent = (WampId, Option<wamp_async::WampArgs>, Option<WampKwArgs>);
 
+/// Subscription handle: used to cancel a subscription; automatically unsubscribes
+/// in the background on drop.
+///
+/// If created by [WaapiClient::subscribe_with_callback], also holds a recv-loop task
+/// that will be aborted on unsubscribe or drop.
+///
+/// ---
+///
 /// 订阅句柄：用于取消订阅；drop 时会自动在后台执行 unsubscribe。
 ///
 /// 若由 [WaapiClient::subscribe_with_callback] 创建，内部还持有一个 recv 循环 task，unsubscribe 或 drop 时会先 abort 该 task。
@@ -56,6 +100,11 @@ pub struct SubscriptionHandle {
     is_unsubscribed: bool,
 }
 
+/// Marks as unsubscribed; returns whether this is the first time
+/// (true = should proceed with network unsubscribe).
+///
+/// ---
+///
 /// 标记为已退订，返回本次是否首次标记（true 表示应继续执行网络退订）。
 fn mark_unsubscribed(flag: &mut bool) -> bool {
     if *flag {
@@ -66,21 +115,44 @@ fn mark_unsubscribed(flag: &mut bool) -> bool {
     }
 }
 
-/// WAAPI 异步客户端
+/// Async WAAPI client.
+///
+/// Provides async access to the Wwise Authoring API (WAAPI);
+/// can be shared across tasks (internal Arc + Mutex).
+///
+/// The client makes a best-effort cleanup on Drop, but spawned async tasks
+/// are not guaranteed to finish before process exit.
+/// **It is recommended to call [`disconnect`](WaapiClient::disconnect) explicitly**
+/// for graceful shutdown.
+///
+/// ---
+///
+/// WAAPI 异步客户端。
 ///
 /// 提供异步接口访问 Wwise Authoring API (WAAPI)；可在多任务间共享使用（内部 Arc + Mutex）。
 ///
 /// 客户端在 Drop 时会尽力清理资源，但 spawn 的异步任务不保证在进程退出前完成，
 /// **建议显式调用 [`disconnect`](WaapiClient::disconnect)** 以确保优雅关闭。
 pub struct WaapiClient {
+    /// Outer Option for take() during cleanup/disconnect;
+    /// inner Option (inside Mutex) for take() to call `Client::disconnect(self)`.
+    ///
     /// 外层 Option 供 cleanup/disconnect 时 take() 转移所有权；
     /// 内层 Option（Mutex 内）供 disconnect 逻辑 take() 出 Client 以调用 `Client::disconnect(self)`。
     client: Option<Arc<TokioMutex<Option<Client<'static>>>>>,
     event_loop_handle: Option<tokio::task::JoinHandle<Result<(), WampError>>>,
-    /// 当前活跃的订阅 ID，disconnect 时统一 unsubscribe
+    /// Active subscription IDs; all unsubscribed on disconnect.
+    ///
+    /// 当前活跃的订阅 ID，disconnect 时统一 unsubscribe。
     subscription_ids: Arc<StdMutex<Vec<WampId>>>,
 }
 
+/// Async cleanup from taken fields: unsubscribe all → leave_realm → disconnect → abort event loop.
+///
+/// Shared by [WaapiClient::cleanup] and `Drop for WaapiClient` to avoid logic duplication.
+///
+/// ---
+///
 /// 从已取出的字段执行异步清理：取消所有订阅 → leave_realm → disconnect → abort 事件循环。
 ///
 /// 供 [WaapiClient::cleanup] 与 `Drop for WaapiClient` 共用，避免逻辑重复。
@@ -112,14 +184,26 @@ async fn do_cleanup(
 }
 
 impl WaapiClient {
-    /// 使用默认 URL 连接到 WAAPI
+    /// Connect to WAAPI using the default URL.
     ///
-    /// 默认连接到 `ws://localhost:8080/waapi`，使用默认 realm；
+    /// Connects to `ws://localhost:8080/waapi` with the default realm.
+    ///
+    /// ---
+    ///
+    /// 使用默认 URL 连接到 WAAPI。
+    ///
+    /// 默认连接到 `ws://localhost:8080/waapi`，使用默认 realm。
     pub async fn connect() -> Result<Self, WaapiError> {
         Self::connect_with_url(DEFAULT_WAAPI_URL).await
     }
 
-    /// 使用指定 URL 连接到 WAAPI
+    /// Connect to WAAPI at the specified URL.
+    ///
+    /// Joins the default realm after connecting; serialization is JSON, SSL verification disabled.
+    ///
+    /// ---
+    ///
+    /// 使用指定 URL 连接到 WAAPI。
     ///
     /// 连接后加入默认 realm；序列化为 JSON，SSL 校验关闭。
     pub async fn connect_with_url(url: &str) -> Result<Self, WaapiError> {
@@ -146,11 +230,25 @@ impl WaapiClient {
         })
     }
 
-    /// 调用 WAAPI 方法
+    /// Call a WAAPI method.
+    ///
+    /// # Parameters
+    ///
+    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"`
+    /// * `args` - Optional keyword arguments (`impl Serialize`, e.g. `json!` or `#[derive(Serialize)]` structs)
+    /// * `options` - Optional options dict (`impl Serialize`, may differ from `args` type)
+    ///
+    /// Returns `Option<R>` where `R: DeserializeOwned`.
+    ///
+    /// Note: holds the connection lock for the entire RPC call; only one call executes at a time.
+    ///
+    /// ---
+    ///
+    /// 调用 WAAPI 方法。
     ///
     /// # 参数
     ///
-    /// * `uri` - WAAPI 方法的 URI，如 "ak.wwise.core.getInfo"
+    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"`
     /// * `args` - 可选的关键字参数（`impl Serialize`，如 `json!` 或带 `#[derive(Serialize)]` 的结构体）
     /// * `options` - 可选的选项字典（`impl Serialize`，可与 args 不同类型）
     ///
@@ -193,6 +291,11 @@ impl WaapiClient {
         Ok(out)
     }
 
+    /// Convenience no-args call, equivalent to `call(uri, None, None)`.
+    /// Specify the return type via turbofish, e.g. `call_no_args::<serde_json::Value>(uri)`.
+    ///
+    /// ---
+    ///
     /// 无参便捷调用，等价于 `call(uri, None, None)`；返回类型由泛型指定，如 `call_no_args::<serde_json::Value>(uri)`。
     pub async fn call_no_args<R>(&self, uri: &str) -> Result<Option<R>, WaapiError>
     where
@@ -202,9 +305,17 @@ impl WaapiClient {
             .await
     }
 
+    /// Subscribe to a topic, returning an event stream and a handle.
+    ///
+    /// The caller should consume the returned receiver in a separate task to avoid
+    /// backpressure buildup. To unsubscribe: call [SubscriptionHandle::unsubscribe]
+    /// on the returned handle, or drop it (auto-cancels in background).
+    ///
+    /// ---
+    ///
     /// 订阅主题，返回事件流与句柄。
     ///
-    /// 调用方应在单独 task 中消费返回的 receiver，否则会积压；sender 在 client 内部，断开连接时 channel 会关闭。
+    /// 调用方应在单独 task 中消费返回的 receiver，否则会积压。
     /// 取消订阅：调用返回的 [SubscriptionHandle::unsubscribe]，或 drop handle（会在后台自动取消）。
     pub async fn subscribe(
         &self,
@@ -239,6 +350,14 @@ impl WaapiClient {
         Ok((handle, queue))
     }
 
+    /// Subscribe to a topic with a callback: spawns a task to receive events
+    /// and invoke `callback(args, kwargs)`.
+    ///
+    /// The callback runs in a dedicated task and does not block the event loop.
+    /// The returned handle is used to cancel; on drop it aborts the task and auto-unsubscribes.
+    ///
+    /// ---
+    ///
     /// 订阅主题并绑定回调：内部 spawn 一个 task 循环接收事件并调用 `callback(args, kwargs)`。
     ///
     /// 回调在独立 task 中执行，不阻塞事件循环。返回的句柄用于取消订阅；drop 时会 abort 该 task 并自动 unsubscribe。
@@ -278,6 +397,13 @@ impl WaapiClient {
         Ok(handle)
     }
 
+    /// Check whether the client is still logically connected.
+    ///
+    /// Note: reflects local state only (whether `disconnect` has been called);
+    /// does not probe the underlying WebSocket.
+    ///
+    /// ---
+    ///
     /// 检查客户端是否仍处于逻辑连接状态。
     ///
     /// 注意：仅反映本地状态（是否调用过 `disconnect`），不检测底层 WebSocket 是否存活。
@@ -286,15 +412,24 @@ impl WaapiClient {
         self.client.is_some()
     }
 
-    /// 显式断开连接
+    /// Explicitly disconnect.
     ///
-    /// 注意：即使不调用此方法，Drop 时也会尽力清理，但 **推荐显式调用** 以确保优雅关闭。
+    /// Even without calling this, Drop will try to clean up,
+    /// but **explicit call is recommended** for graceful shutdown.
+    ///
+    /// ---
+    ///
+    /// 显式断开连接。
+    ///
+    /// 即使不调用此方法，Drop 时也会尽力清理，但 **推荐显式调用** 以确保优雅关闭。
     pub async fn disconnect(mut self) {
         info!("Disconnecting from WAAPI");
         self.cleanup().await;
         info!("Disconnected from WAAPI");
     }
 
+    /// Internal cleanup: delegates to [do_cleanup].
+    ///
     /// 内部清理：委托给 [do_cleanup]。
     async fn cleanup(&mut self) {
         do_cleanup(
@@ -307,7 +442,11 @@ impl WaapiClient {
 }
 
 impl SubscriptionHandle {
-    /// 取消订阅并停止回调循环（若有）
+    /// Cancel the subscription and stop the callback loop (if any).
+    ///
+    /// ---
+    ///
+    /// 取消订阅并停止回调循环（若有）。
     pub async fn unsubscribe(mut self) -> Result<(), WaapiError> {
         debug!("Unsubscribing sub_id={}", self.sub_id);
         if let Some(task) = self.recv_task.take() {
@@ -328,6 +467,9 @@ impl SubscriptionHandle {
 }
 
 impl Drop for SubscriptionHandle {
+    /// Async cleanup via try_current(): spawns an unsubscribe task on the existing runtime,
+    /// avoiding `.await` inside drop. Falls back to local-only cleanup if no runtime is available.
+    ///
     /// 异步清理：通过 try_current() 在已有 runtime 上 spawn unsubscribe 任务，避免在 drop 中 .await 阻塞；
     /// 若无当前 runtime 则仅清理本地状态，跳过网络取消（连接已失效）。
     fn drop(&mut self) {
@@ -358,6 +500,8 @@ impl Drop for SubscriptionHandle {
 }
 
 impl Drop for WaapiClient {
+    /// Spawns async cleanup if a runtime is available; otherwise only aborts the event loop.
+    ///
     /// 若有当前 runtime 则 spawn 异步清理，否则仅 abort 事件循环。
     fn drop(&mut self) {
         if self.client.is_some() || self.event_loop_handle.is_some() {
@@ -377,10 +521,18 @@ impl Drop for WaapiClient {
     }
 }
 
+/// Sync subscription handle: cancels subscriptions created by
+/// [WaapiClientSync::subscribe] or [WaapiClientSync::subscribe_with_callback].
+///
+/// Calls [SubscriptionHandleSync::unsubscribe] or drop to cancel and wait for the bridge thread.
+/// **Do not drop this handle inside a callback — it may deadlock.**
+///
+/// ---
+///
 /// 同步订阅句柄：用于取消通过 [WaapiClientSync::subscribe] 或 [WaapiClientSync::subscribe_with_callback] 创建的订阅。
 ///
 /// 调用 [SubscriptionHandleSync::unsubscribe] 或 drop 时取消订阅并等待桥接线程结束。
-/// 注意：不要在回调内部 drop 本句柄，否则可能死锁。
+/// **注意：不要在回调内部 drop 本句柄，否则可能死锁。**
 pub struct SubscriptionHandleSync {
     runtime: Arc<tokio::runtime::Runtime>,
     inner: Option<SubscriptionHandle>,
@@ -389,6 +541,10 @@ pub struct SubscriptionHandleSync {
 }
 
 impl SubscriptionHandleSync {
+    /// Cancel the subscription and wait for the event bridge thread to finish.
+    ///
+    /// ---
+    ///
     /// 取消订阅并等待事件桥接线程结束。
     pub fn unsubscribe(mut self) -> Result<(), WaapiError> {
         let inner = self.inner.take();
@@ -404,6 +560,9 @@ impl SubscriptionHandleSync {
 }
 
 impl Drop for SubscriptionHandleSync {
+    /// When not on the bridge thread: block_on unsubscribe and join the bridge thread.
+    /// Inside the bridge thread or async context: falls back to spawn to avoid deadlock/panic.
+    ///
     /// 不在桥接线程时：block_on 执行 unsubscribe 并 join 桥接线程；
     /// 在桥接线程或 async 上下文中则降级为 spawn，避免死锁/panic。
     fn drop(&mut self) {
@@ -429,7 +588,18 @@ impl Drop for SubscriptionHandleSync {
     }
 }
 
-/// WAAPI 同步客户端
+/// Sync WAAPI client.
+///
+/// Provides sync access to the Wwise Authoring API (WAAPI); internally uses a multi-threaded
+/// tokio runtime and wraps [WaapiClient] via `block_on`. Suitable for scripts and non-async code;
+/// if already in an async context, prefer [WaapiClient] directly.
+///
+/// The client auto-cleans on Drop, but **explicit [`disconnect`](WaapiClientSync::disconnect)
+/// is recommended** for graceful shutdown.
+///
+/// ---
+///
+/// WAAPI 同步客户端。
 ///
 /// 提供同步接口访问 Wwise Authoring API (WAAPI)；内部使用多线程 tokio runtime，通过 `block_on` 封装 [WaapiClient]。
 /// 适用于脚本、非 async 代码；若已在 async 环境中，建议直接使用 [WaapiClient]。
@@ -441,14 +611,27 @@ pub struct WaapiClientSync {
 }
 
 impl WaapiClientSync {
-    /// 使用默认 URL 连接到 WAAPI
+    /// Connect to WAAPI using the default URL.
     ///
-    /// 默认连接到 `ws://localhost:8080/waapi`，使用默认 realm；
+    /// Connects to `ws://localhost:8080/waapi` with the default realm.
+    ///
+    /// ---
+    ///
+    /// 使用默认 URL 连接到 WAAPI。
+    ///
+    /// 默认连接到 `ws://localhost:8080/waapi`，使用默认 realm。
     pub fn connect() -> Result<Self, WaapiError> {
         Self::connect_with_url(DEFAULT_WAAPI_URL)
     }
 
-    /// 使用指定 URL 连接到 WAAPI
+    /// Connect to WAAPI at the specified URL.
+    ///
+    /// Joins the default realm after connecting; internally uses `block_on` to call
+    /// the async client. Serialization and SSL behavior match the async variant.
+    ///
+    /// ---
+    ///
+    /// 使用指定 URL 连接到 WAAPI。
     ///
     /// 连接后加入默认 realm；内部通过 block_on 调用异步客户端，序列化与 SSL 行为与异步版一致。
     pub fn connect_with_url(url: &str) -> Result<Self, WaapiError> {
@@ -467,11 +650,23 @@ impl WaapiClientSync {
         })
     }
 
-    /// 调用 WAAPI 方法
+    /// Call a WAAPI method.
+    ///
+    /// # Parameters
+    ///
+    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"`
+    /// * `args` - Optional keyword arguments (`impl Serialize`)
+    /// * `options` - Optional options dict (`impl Serialize`, may differ from `args` type)
+    ///
+    /// Returns `Option<R>` where `R: DeserializeOwned`.
+    ///
+    /// ---
+    ///
+    /// 调用 WAAPI 方法。
     ///
     /// # 参数
     ///
-    /// * `uri` - WAAPI 方法的 URI，如 "ak.wwise.core.getInfo"
+    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"`
     /// * `args` - 可选的关键字参数（`impl Serialize`）
     /// * `options` - 可选的选项字典（`impl Serialize`，可与 args 不同类型）
     ///
@@ -489,6 +684,11 @@ impl WaapiClientSync {
         self.runtime.block_on(client.call(uri, args, options))
     }
 
+    /// Convenience no-args call, equivalent to `call(uri, None, None)`.
+    /// Specify the return type via turbofish, e.g. `call_no_args::<serde_json::Value>(uri)`.
+    ///
+    /// ---
+    ///
     /// 无参便捷调用，等价于 `call(uri, None, None)`；返回类型由泛型指定，如 `call_no_args::<serde_json::Value>(uri)`。
     pub fn call_no_args<R>(&self, uri: &str) -> Result<Option<R>, WaapiError>
     where
@@ -498,6 +698,14 @@ impl WaapiClientSync {
         self.runtime.block_on(client.call_no_args(uri))
     }
 
+    /// Subscribe to a topic, returning a sync handle and a sync channel receiver.
+    /// Use `recv()` or `recv_timeout()` on the receiver to collect events.
+    ///
+    /// To unsubscribe: call [SubscriptionHandleSync::unsubscribe] or drop the handle.
+    /// Do not drop the handle inside a callback.
+    ///
+    /// ---
+    ///
     /// 订阅主题，返回同步句柄与同步 channel 的 receiver；从 receiver 上 `recv()` 或 `recv_timeout()` 收取事件。
     ///
     /// 取消订阅：调用返回的 [SubscriptionHandleSync::unsubscribe]，或 drop 句柄。不要在回调中 drop 句柄。
@@ -536,6 +744,14 @@ impl WaapiClientSync {
         Ok((handle, sync_rx))
     }
 
+    /// Subscribe to a topic with a callback: receives events in a dedicated thread
+    /// and synchronously calls `callback(args, kwargs)`.
+    ///
+    /// To unsubscribe: call [SubscriptionHandleSync::unsubscribe] or drop the handle.
+    /// Do not drop the handle inside the callback.
+    ///
+    /// ---
+    ///
     /// 订阅主题并绑定回调：在独立线程中接收事件并同步调用 `callback(args, kwargs)`。
     ///
     /// 取消订阅：调用返回的 [SubscriptionHandleSync::unsubscribe]，或 drop 句柄。不要在 callback 内 drop 句柄。
@@ -572,6 +788,13 @@ impl WaapiClientSync {
         Ok(handle)
     }
 
+    /// Check whether the client is still logically connected.
+    ///
+    /// Note: reflects local state only (whether `disconnect` has been called);
+    /// does not probe the underlying WebSocket.
+    ///
+    /// ---
+    ///
     /// 检查客户端是否仍处于逻辑连接状态。
     ///
     /// 注意：仅反映本地状态（是否调用过 `disconnect`），不检测底层 WebSocket 是否存活。
@@ -580,9 +803,16 @@ impl WaapiClientSync {
         self.client.as_ref().is_some_and(|c| c.is_connected())
     }
 
-    /// 显式断开连接
+    /// Explicitly disconnect.
     ///
-    /// 注意：即使不调用此方法，Drop 时也会自动断开，但 **推荐显式调用** 以确保优雅关闭。
+    /// Even without calling this, Drop will auto-disconnect,
+    /// but **explicit call is recommended** for graceful shutdown.
+    ///
+    /// ---
+    ///
+    /// 显式断开连接。
+    ///
+    /// 即使不调用此方法，Drop 时也会自动断开，但 **推荐显式调用** 以确保优雅关闭。
     pub fn disconnect(mut self) {
         info!("Disconnecting from WAAPI (sync)");
         if let Some(client) = self.client.take() {
@@ -593,6 +823,11 @@ impl WaapiClientSync {
 }
 
 impl Drop for WaapiClientSync {
+    /// Disconnects on drop. If inside an async context, offloads cleanup to a dedicated thread
+    /// to avoid runtime lifetime issues.
+    /// Note: the spawned thread's JoinHandle is not joined; cleanup may not complete
+    /// if the process is exiting. Prefer calling `disconnect` explicitly.
+    ///
     /// Drop 时断开连接；若在 async 上下文中则将清理转移到独立线程执行，避免 runtime 生命周期导致清理任务丢失。
     /// 注意：该线程的 JoinHandle 未被 join，若进程正在退出，清理可能无法完成；建议显式调用 `disconnect`。
     fn drop(&mut self) {

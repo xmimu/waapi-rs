@@ -1,7 +1,23 @@
-//! waapi-rs：Wwise Authoring API (WAAPI) 的 Rust 客户端
+//! waapi-rs: A Rust client for the Wwise Authoring API (WAAPI).
+//!
+//! Based on WAMP over WebSocket, supporting both async and sync usage.
+//! Main entry points are the async client [WaapiClient] and the sync client [WaapiClientSync].
+//!
+//! ---
+//!
+//! waapi-rs：Wwise Authoring API (WAAPI) 的 Rust 客户端。
 //!
 //! 基于 WAMP over WebSocket，支持异步与同步两种用法。主要入口为异步客户端
 //! [WaapiClient] 与同步客户端 [WaapiClientSync]。
+//!
+//! # Features
+//!
+//! - **Connect**: `WaapiClient::connect()` / `connect_with_url(url)`; sync client [WaapiClientSync] provides the same
+//! - **RPC**: `call(uri, args, options)`, `call_no_args(uri)`
+//! - **Subscribe**: `subscribe(topic)` returns an event stream, or `subscribe_with_callback(topic, callback)` binds a callback
+//! - **Cleanup**: connections and subscriptions auto-clean on Drop; explicit `disconnect` / `SubscriptionHandle::unsubscribe()` also available
+//!
+//! ---
 //!
 //! # 功能概览
 //!
@@ -10,9 +26,11 @@
 //! - **订阅**：`subscribe(topic)` 返回事件流，或 `subscribe_with_callback(topic, callback)` 绑定回调
 //! - **资源**：连接与订阅在 Drop 时自动清理，也可显式 `disconnect` / `SubscriptionHandle::unsubscribe()`
 //!
-//! # 示例
+//! # Examples / 示例
 //!
-//! 异步客户端：连接后调用 WAAPI 方法（如获取 Wwise 版本）：
+//! Async client — connect and call a WAAPI method (e.g. get Wwise version):
+//!
+//! 异步客户端 - 连接后调用 WAAPI 方法（如获取 Wwise 版本）：
 //!
 //! ```rust,no_run
 //! use serde_json::Value;
@@ -33,6 +51,8 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! RPC call with `json!` args and options (e.g. WAQL query):
 //!
 //! 使用 `json!` 构造参数与选项进行 RPC 调用（如 WAQL 查询）：
 //!
@@ -58,7 +78,9 @@
 //! }
 //! ```
 //!
-//! 订阅主题并用回调接收事件（需 Wwise 已启动并启用 Authoring API）：
+//! Subscribe to a topic with a callback:
+//!
+//! 订阅主题并用回调接收事件：
 //!
 //! ```rust,no_run
 //! use waapi_rs::WaapiClient;
@@ -71,12 +93,13 @@
 //!             println!("Selection changed: {:?}", kwargs);
 //!         })
 //!         .await?;
-//!     // 使用完毕后取消订阅并断开
 //!     handle.unsubscribe().await?;
 //!     client.disconnect().await;
 //!     Ok(())
 //! }
 //! ```
+//!
+//! Sync client (for non-async code or scripts):
 //!
 //! 同步客户端（适用于非 async 代码或脚本）：
 //!
@@ -94,6 +117,14 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # `call` constraints
+//!
+//! The return type of `call` / `call_no_args` is `T: DeserializeOwned`
+//! (e.g. `serde_json::Value` or a custom struct), returning `Option<T>`.
+//! `args` / `options` only need to be serializable (`impl Serialize`).
+//!
+//! ---
 //!
 //! # call 约束
 //!
