@@ -43,7 +43,7 @@ flowchart LR
 
 ## RPC 与 URI 常量
 
-- **call 泛型**：`call<T>(uri, args, options)`、`call_no_args<T>(uri)` 的泛型 `T` 表示**返回值**的反序列化类型，需满足 `Serialize + DeserializeOwned`（如 `serde_json::Value` 或自定义结构体）。返回 `Result<Option<T>, Error>`：成功时 WAAPI 的 kwargs 反序列化为 `T`，无结果时为 `None`；args/options 仍为可序列化类型（通常 `Value` 或 `impl Serialize`）。
+- **call 泛型**：`call<T>(uri, args, options)`、`call_no_args<T>(uri)` 的泛型 `T` 表示**返回值**的反序列化类型，需满足 `DeserializeOwned`（如 `serde_json::Value` 或自定义结构体）。返回 `Result<Option<T>, Error>`：成功时 WAAPI 的 kwargs 反序列化为 `T`，无结果时为 `None`；args/options 仍为可序列化类型（通常 `Value` 或 `impl Serialize`）。
 - **URI 常量（uris）**：`src/uris.rs` 中按 WAAPI URI 路径组织嵌套模块（`ak::soundengine`、`ak::wwise::core`、`ak::wwise::debug`、`ak::wwise::ui`、`ak::wwise::waapi`），每层提供 `pub const XXX: &str = "ak.xxx.xxx"`。库通过 `pub use uris::ak` 重导出，用户只需 `use waapi_rs::ak`，调用时从 `ak::` 写路径（如 `ak::wwise::core::GET_INFO`），与 C++ WAAPI / 官方 URI 命名一致，便于补全与避免手写字符串。
 
 ## 订阅模型
@@ -60,7 +60,7 @@ flowchart LR
 
 ## 错误与边界
 
-- **错误类型**：公开 API 使用 `Result<T, Box<dyn std::error::Error>>`，便于与 `wamp_async` 及 IO 错误兼容。
+- **错误类型**：公开 API 使用 `Result<T, WaapiError>`；`WaapiError` 通过 `thiserror` 聚合了 WAMP 协议（`WampError`）、序列化（`serde_json::Error`）、IO（`std::io::Error`）及客户端已断开（`Disconnected`）四类错误。
 - **“Client already disconnected”**：在 `client` 或 `client.lock().await` 为 `None` 时返回（例如已调用 `disconnect` 或 `cleanup` 之后再次 call/subscribe）。
 - **测试**：部分测试依赖本机 WAAPI（Wwise 已启动且启用 Authoring API）；若连接失败则 `eprintln` 说明并 return，不 panic，实现“可选 WAAPI 的 CI 友好”的跳过策略。
 

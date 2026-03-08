@@ -97,7 +97,8 @@
 //!
 //! # call 约束
 //!
-//! `call` 的入参与返回值统一为 `T: Serialize + DeserializeOwned`（如 `serde_json::Value`、自定义结构体），返回 `Option<T>`。
+//! `call` / `call_no_args` 的返回值类型为 `T: DeserializeOwned`（如 `serde_json::Value`、自定义结构体），返回 `Option<T>`；
+//! `args` / `options` 仅需可序列化（`impl Serialize`）。
 
 mod args;
 mod client;

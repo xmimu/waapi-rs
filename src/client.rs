@@ -53,6 +53,17 @@ pub struct SubscriptionHandle {
     client: Arc<TokioMutex<Option<Client<'static>>>>,
     subscription_ids: Arc<StdMutex<Vec<WampId>>>,
     recv_task: Option<tokio::task::JoinHandle<()>>,
+    is_unsubscribed: bool,
+}
+
+/// 标记为已退订，返回本次是否首次标记（true 表示应继续执行网络退订）。
+fn mark_unsubscribed(flag: &mut bool) -> bool {
+    if *flag {
+        false
+    } else {
+        *flag = true;
+        true
+    }
 }
 
 /// WAAPI 异步客户端
@@ -62,6 +73,8 @@ pub struct SubscriptionHandle {
 /// 客户端在 Drop 时会尽力清理资源，但 spawn 的异步任务不保证在进程退出前完成，
 /// **建议显式调用 [`disconnect`](WaapiClient::disconnect)** 以确保优雅关闭。
 pub struct WaapiClient {
+    /// 外层 Option 供 cleanup/disconnect 时 take() 转移所有权；
+    /// 内层 Option（Mutex 内）供 disconnect 逻辑 take() 出 Client 以调用 `Client::disconnect(self)`。
     client: Option<Arc<TokioMutex<Option<Client<'static>>>>>,
     event_loop_handle: Option<tokio::task::JoinHandle<Result<(), WampError>>>,
     /// 当前活跃的订阅 ID，disconnect 时统一 unsubscribe
@@ -142,6 +155,8 @@ impl WaapiClient {
     /// * `options` - 可选的选项字典（`impl Serialize`，可与 args 不同类型）
     ///
     /// 返回 `Option<R>`，`R` 需满足 `DeserializeOwned`。
+    ///
+    /// 注意：内部在整个 RPC 调用期间持有连接锁，同一时间只能有一个调用在执行。
     pub async fn call<R>(
         &self,
         uri: &str,
@@ -219,6 +234,7 @@ impl WaapiClient {
             client: Arc::clone(client),
             subscription_ids: Arc::clone(&self.subscription_ids),
             recv_task: None,
+            is_unsubscribed: false,
         };
         Ok((handle, queue))
     }
@@ -257,6 +273,7 @@ impl WaapiClient {
             client: Arc::clone(client),
             subscription_ids: Arc::clone(&self.subscription_ids),
             recv_task: Some(recv_task),
+            is_unsubscribed: false,
         };
         Ok(handle)
     }
@@ -300,6 +317,9 @@ impl SubscriptionHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|&id| id != self.sub_id);
+        if !mark_unsubscribed(&mut self.is_unsubscribed) {
+            return Ok(());
+        }
         if let Some(ref c) = *self.client.lock().await {
             c.unsubscribe(self.sub_id).await?;
         }
@@ -321,6 +341,9 @@ impl Drop for SubscriptionHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|&id| id != sub_id);
+        if !mark_unsubscribed(&mut self.is_unsubscribed) {
+            return;
+        }
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             debug!("SubscriptionHandle dropped, spawning unsubscribe for sub_id={sub_id}");
             rt.spawn(async move {
@@ -533,7 +556,6 @@ impl WaapiClientSync {
             .block_on(client.subscribe(topic))?;
         let (id_tx, id_rx) = mpsc::channel();
         let runtime = Arc::clone(&self.runtime);
-        let callback = Arc::new(callback);
         let bridge_join = thread::spawn(move || {
             let _ = id_tx.send(thread::current().id());
             while let Some((_, args, kwargs)) = runtime.block_on(async_rx.recv()) {
@@ -571,17 +593,54 @@ impl WaapiClientSync {
 }
 
 impl Drop for WaapiClientSync {
-    /// Drop 时断开连接；若在 async 上下文中则降级为 spawn，避免 panic。
+    /// Drop 时断开连接；若在 async 上下文中则将清理转移到独立线程执行，避免 runtime 生命周期导致清理任务丢失。
+    /// 注意：该线程的 JoinHandle 未被 join，若进程正在退出，清理可能无法完成；建议显式调用 `disconnect`。
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
             if tokio::runtime::Handle::try_current().is_ok() {
-                warn!("WaapiClientSync dropped inside async context, falling back to spawn");
-                self.runtime.handle().spawn(async move {
-                    client.disconnect().await;
-                });
+                warn!("WaapiClientSync dropped inside async context, offloading cleanup to a dedicated thread");
+                let runtime = Arc::clone(&self.runtime);
+                let _ = thread::Builder::new()
+                    .name("waapi-sync-drop-cleanup".to_string())
+                    .spawn(move || {
+                        runtime.block_on(client.disconnect());
+                    });
             } else {
                 self.runtime.block_on(client.disconnect());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mark_unsubscribed_is_idempotent() {
+        let mut is_unsubscribed = false;
+        assert!(mark_unsubscribed(&mut is_unsubscribed));
+        assert!(!mark_unsubscribed(&mut is_unsubscribed));
+    }
+
+    #[tokio::test]
+    async fn test_sync_client_drop_inside_async_context_is_safe() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create runtime"),
+        );
+        let async_client = WaapiClient {
+            client: None,
+            event_loop_handle: None,
+            subscription_ids: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let sync_client = WaapiClientSync {
+            runtime,
+            client: Some(async_client),
+        };
+
+        drop(sync_client);
     }
 }
