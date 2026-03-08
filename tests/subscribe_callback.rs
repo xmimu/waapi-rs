@@ -16,7 +16,7 @@ async fn test_subscribe_with_callback() {
     let client: WaapiClient = match WaapiClient::connect().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
@@ -27,7 +27,7 @@ async fn test_subscribe_with_callback() {
     let handler = client
         .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, move |_args, kwargs| {
             count_clone.fetch_add(1, Ordering::Relaxed);
-            println!("[test] selectionChanged: {:?}", kwargs);
+            println!("[test] selectionChanged: {kwargs:?}");
         })
         .await
         .expect("subscribe_with_callback failed");
@@ -52,14 +52,14 @@ async fn test_subscribe_callback_drop_handle() {
     let client: WaapiClient = match WaapiClient::connect().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
 
     let handler = client
         .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, kwargs| {
-            println!("[test] selectionChanged (drop_handle): {:?}", kwargs);
+            println!("[test] selectionChanged (drop_handle): {kwargs:?}");
         })
         .await
         .expect("subscribe_with_callback failed");

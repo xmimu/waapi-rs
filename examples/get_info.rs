@@ -9,6 +9,7 @@ use waapi_rs::{ak::wwise::core, WaapiClient};
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let client = WaapiClient::connect().await.expect("Failed to connect");
 
     let result = client
@@ -23,7 +24,7 @@ async fn main() {
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown");
 
-        println!("Wwise Version: {}", version);
+        println!("Wwise Version: {version}");
     }
 
     client.disconnect().await;

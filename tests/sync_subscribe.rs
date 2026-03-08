@@ -11,7 +11,7 @@ fn test_sync_subscribe_and_unsubscribe() {
     let client = match WaapiClientSync::connect() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
@@ -19,7 +19,7 @@ fn test_sync_subscribe_and_unsubscribe() {
     let (handle, rx) = match client.subscribe(ak::wwise::ui::SELECTION_CHANGED) {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("Skip: subscribe failed ({})", e);
+            eprintln!("Skip: subscribe failed ({e})");
             client.disconnect();
             return;
         }
@@ -36,7 +36,7 @@ fn test_sync_subscribe_with_callback() {
     let client = match WaapiClientSync::connect() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
@@ -44,7 +44,7 @@ fn test_sync_subscribe_with_callback() {
     let handle = match client.subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, _kwargs| {}) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("Skip: subscribe_with_callback failed ({})", e);
+            eprintln!("Skip: subscribe_with_callback failed ({e})");
             client.disconnect();
             return;
         }

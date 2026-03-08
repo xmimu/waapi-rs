@@ -14,7 +14,7 @@ async fn test_subscribe_and_unsubscribe() {
     let client = match WaapiClient::connect().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
@@ -40,7 +40,7 @@ async fn test_subscribe_receiver_dropped_then_unsubscribe() {
     let client = match WaapiClient::connect().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
@@ -48,7 +48,7 @@ async fn test_subscribe_receiver_dropped_then_unsubscribe() {
     let (handle, rx) = match client.subscribe(SELECTION_CHANGED).await {
         Ok(pair) => pair,
         Err(e) => {
-            eprintln!("Skip: subscribe failed ({})", e);
+            eprintln!("Skip: subscribe failed ({e})");
             client.disconnect().await;
             return;
         }

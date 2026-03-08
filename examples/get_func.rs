@@ -3,6 +3,7 @@ use waapi_rs::{ak, WaapiClient};
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     let client = WaapiClient::connect().await.expect("Failed to connect");
 
     let result = client
@@ -11,7 +12,7 @@ async fn main() {
         .expect("WAAPI call failed");
 
     if let Some(map) = result {
-        println!("Functions: {:?}", map);
+        println!("Functions: {map:?}");
     }
 
     client.disconnect().await;

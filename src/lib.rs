@@ -106,4 +106,5 @@ pub use uris::ak;
 
 pub use client::{
     SubscribeEvent, SubscriptionHandle, SubscriptionHandleSync, WaapiClient, WaapiClientSync,
+    WaapiError,
 };

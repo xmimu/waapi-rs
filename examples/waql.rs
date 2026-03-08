@@ -3,18 +3,19 @@
 //! 本示例演示如何使用 `ak::wwise::core::object::get` 接口，
 //! 配合 WAQL 语句获取指定类型的 Wwise 对象（此处为 Event 类型）。
 
-use serde_json::json;
+use serde_json::{json, Value};
 use waapi_rs::{ak, WaapiClient};
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     // 连接到 Wwise 的 WAAPI 服务（需 Wwise 已启动且启用 WAAPI）
     let client = WaapiClient::connect().await.expect("Failed to connect");
 
     // WAQL 查询：获取所有类型为 Event 的对象（$ 表示根，from type Event 表示筛选 Event 类型）
     let waql = "$ from type Event";
 
-    let result = client
+    let result: Option<Value> = client
         .call(
             ak::wwise::core::OBJECT_GET,
             Some(json!({ "waql": waql })),
@@ -24,7 +25,7 @@ async fn main() {
         .expect("WAAPI call failed");
 
     if let Some(map) = result {
-        println!("Objects: {:#?}", map);
+        println!("Objects: {map:#?}");
     }
 
     client.disconnect().await;

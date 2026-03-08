@@ -39,7 +39,7 @@ waapi-rs = { path = "../waapi-rs" }
 
 ```rust
 use serde_json::Value;
-use waapi-rs::{ak, WaapiClient};
+use waapi_rs::{ak, WaapiClient};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

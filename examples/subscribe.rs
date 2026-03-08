@@ -23,6 +23,7 @@ use waapi_rs::WaapiClient;
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
     // Connect (default URL ws://localhost:8080/waapi)
     let client = WaapiClient::connect()
         .await
@@ -35,7 +36,7 @@ async fn main() {
     );
     let handler = client
         .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, kwargs| {
-            println!("Selection changed: {:?}", kwargs);
+            println!("Selection changed: {kwargs:?}");
         })
         .await
         .expect("Subscribe failed");

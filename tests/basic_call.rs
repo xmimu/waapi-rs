@@ -10,7 +10,7 @@ async fn test_waapi_get_info() {
     let client = match WaapiClient::connect().await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Skip: WAAPI not available ({})", e);
+            eprintln!("Skip: WAAPI not available ({e})");
             return;
         }
     };
@@ -30,7 +30,7 @@ async fn test_waapi_get_info() {
 
     // 可选：打印版本信息用于调试
     if let Some(version) = info.get("version") {
-        println!("Wwise version: {:?}", version);
+        println!("Wwise version: {version:?}");
     }
 
     // 断开连接
