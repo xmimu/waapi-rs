@@ -25,12 +25,12 @@ async fn test_subscribe_with_callback() {
     let count = Arc::new(AtomicU32::new(0));
     let count_clone = Arc::clone(&count);
     let handler = client
-        .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, move |_args, kwargs| {
+        .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, move |_args, kwargs| {
             count_clone.fetch_add(1, Ordering::Relaxed);
             println!("[test] selectionChanged: {kwargs:?}");
         })
         .await
-        .expect("subscribe_with_callback failed");
+        .expect("subscribe failed");
 
     // 短暂等待，看是否收到事件（不强制）
     let _ = timeout(Duration::from_millis(500), async {
@@ -58,11 +58,11 @@ async fn test_subscribe_callback_drop_handle() {
     };
 
     let handler = client
-        .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, kwargs| {
+        .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_args, kwargs| {
             println!("[test] selectionChanged (drop_handle): {kwargs:?}");
         })
         .await
-        .expect("subscribe_with_callback failed");
+        .expect("subscribe failed");
 
     // drop 句柄应自动取消订阅（与 Python 的 with 块结束类似）
     drop(handler);

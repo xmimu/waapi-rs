@@ -20,8 +20,7 @@
 
 ## P1 — 功能与改进
 
-- [ ] **subscribe 支持传 options 参数**
-  当前 `subscribe` / `subscribe_with_callback` 不支持传入 options，需要增加带 options 的重载（如 `subscribe_with_options(topic, options)` / `subscribe_with_callback_and_options(topic, options, callback)`），以支持 WAAPI 订阅时的过滤、返回字段等选项
+- [x] **subscribe 支持传 options 参数** — 已支持，`subscribe(topic, options, callback)` 的 `options: Option<Value>` 可用于过滤、返回字段等
 
 ## P1 — 强烈建议
 

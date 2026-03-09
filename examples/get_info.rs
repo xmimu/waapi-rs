@@ -4,7 +4,6 @@
 //!
 //! 运行方式：`cargo run --example get_info`
 
-use serde_json::Value;
 use waapi_rs::{ak::wwise::core, WaapiClient};
 
 #[tokio::main]
@@ -13,7 +12,7 @@ async fn main() {
     let client = WaapiClient::connect().await.expect("Failed to connect");
 
     let result = client
-        .call_no_args::<Value>(core::GET_INFO)
+        .call(core::GET_INFO, None, None)
         .await
         .expect("WAAPI call failed");
 

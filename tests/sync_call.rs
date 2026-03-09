@@ -2,8 +2,7 @@
 //!
 //! 运行方式：`cargo test`。若本机未运行 Wwise 或未启用 Authoring API，测试会自动跳过（eprintln + return）。
 
-use serde_json::Value;
-use waapi_rs::WaapiClientSync;
+use waapi_rs::{ak, WaapiClientSync};
 
 #[test]
 fn test_waapi_get_info_sync() {
@@ -17,7 +16,7 @@ fn test_waapi_get_info_sync() {
 
     // 同步调用 getInfo 接口（无参需指定返回类型）
     let result = client
-        .call_no_args::<Value>("ak.wwise.core.getInfo")
+        .call(ak::wwise::core::GET_INFO, None, None)
         .expect("WAAPI call failed");
 
     // 验证返回结果（result 为 Option<Value>）

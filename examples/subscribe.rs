@@ -29,13 +29,13 @@ async fn main() {
         .await
         .expect("Failed to connect to WAAPI. Ensure Wwise is running with Authoring API enabled.");
 
-    // 方式一：subscribe_with_callback —— 对应 Python 的 subscribe(topic, lambda obj: ...)
+    // 对应 Python 的 subscribe(topic, lambda obj: ...)
     println!(
         "Subscribing to {} with callback...",
         ak::wwise::ui::SELECTION_CHANGED
     );
     let handler = client
-        .subscribe_with_callback(ak::wwise::ui::SELECTION_CHANGED, |_args, kwargs| {
+        .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_args, kwargs| {
             println!("Selection changed: {kwargs:?}");
         })
         .await

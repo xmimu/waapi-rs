@@ -17,8 +17,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread;
 
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use wamp_async::{Client, ClientConfig, SerializerType, WampError, WampId, WampKwArgs};
 
@@ -84,14 +83,13 @@ pub type SubscribeEvent = (WampId, Option<wamp_async::WampArgs>, Option<WampKwAr
 /// Subscription handle: used to cancel a subscription; automatically unsubscribes
 /// in the background on drop.
 ///
-/// If created by [WaapiClient::subscribe_with_callback], also holds a recv-loop task
-/// that will be aborted on unsubscribe or drop.
+/// Holds a recv-loop task that will be aborted on unsubscribe or drop.
 ///
 /// ---
 ///
 /// 订阅句柄：用于取消订阅；drop 时会自动在后台执行 unsubscribe。
 ///
-/// 若由 [WaapiClient::subscribe_with_callback] 创建，内部还持有一个 recv 循环 task，unsubscribe 或 drop 时会先 abort 该 task。
+/// 内部持有一个 recv 循环 task，unsubscribe 或 drop 时会先 abort 该 task。
 pub struct SubscriptionHandle {
     sub_id: WampId,
     client: Arc<TokioMutex<Option<Client<'static>>>>,
@@ -234,11 +232,11 @@ impl WaapiClient {
     ///
     /// # Parameters
     ///
-    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"`
-    /// * `args` - Optional keyword arguments (`impl Serialize`, e.g. `json!` or `#[derive(Serialize)]` structs)
-    /// * `options` - Optional options dict (`impl Serialize`, may differ from `args` type)
+    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"` or `ak::wwise::core::GET_INFO`
+    /// * `args` - Optional keyword arguments (`serde_json::Value`, e.g. `json!({...})`)
+    /// * `options` - Optional options dict (`serde_json::Value`, may differ from `args`)
     ///
-    /// Returns `Option<R>` where `R: DeserializeOwned`.
+    /// Returns `Option<Value>`: WAAPI kwargs deserialized as JSON; `None` when no result.
     ///
     /// Note: holds the connection lock for the entire RPC call; only one call executes at a time.
     ///
@@ -248,32 +246,21 @@ impl WaapiClient {
     ///
     /// # 参数
     ///
-    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"`
-    /// * `args` - 可选的关键字参数（`impl Serialize`，如 `json!` 或带 `#[derive(Serialize)]` 的结构体）
-    /// * `options` - 可选的选项字典（`impl Serialize`，可与 args 不同类型）
+    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"` 或 `ak::wwise::core::GET_INFO`
+    /// * `args` - 可选的关键字参数（`serde_json::Value`，如 `json!({...})`）
+    /// * `options` - 可选的选项字典（`serde_json::Value`，可与 args 不同）
     ///
-    /// 返回 `Option<R>`，`R` 需满足 `DeserializeOwned`。
+    /// 返回 `Option<Value>`：WAAPI kwargs 反序列化为 JSON；无结果时为 `None`。
     ///
     /// 注意：内部在整个 RPC 调用期间持有连接锁，同一时间只能有一个调用在执行。
-    pub async fn call<R>(
+    pub async fn call(
         &self,
         uri: &str,
-        args: Option<impl Serialize>,
-        options: Option<impl Serialize>,
-    ) -> Result<Option<R>, WaapiError>
-    where
-        R: DeserializeOwned,
-    {
-        let args = args
-            .map(serde_json::to_value)
-            .transpose()?
-            .map(value_to_kwargs)
-            .transpose()?;
-        let options = options
-            .map(serde_json::to_value)
-            .transpose()?
-            .map(value_to_wamp_dict)
-            .transpose()?;
+        args: Option<Value>,
+        options: Option<Value>,
+    ) -> Result<Option<Value>, WaapiError> {
+        let args = args.map(value_to_kwargs).transpose()?;
+        let options = options.map(value_to_wamp_dict).transpose()?;
         let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
         debug!("Calling WAAPI: {uri}");
         let (_, result) = client
@@ -283,43 +270,15 @@ impl WaapiClient {
             .ok_or(WaapiError::Disconnected)?
             .call(uri, None, args, options)
             .await?;
-        let out = result
-            .map(wamp_result_to_value)
-            .transpose()?
-            .map(serde_json::from_value)
-            .transpose()?;
+        let out = result.map(wamp_result_to_value).transpose()?;
         Ok(out)
     }
 
-    /// Convenience no-args call, equivalent to `call(uri, None, None)`.
-    /// Specify the return type via turbofish, e.g. `call_no_args::<serde_json::Value>(uri)`.
-    ///
-    /// ---
-    ///
-    /// 无参便捷调用，等价于 `call(uri, None, None)`；返回类型由泛型指定，如 `call_no_args::<serde_json::Value>(uri)`。
-    pub async fn call_no_args<R>(&self, uri: &str) -> Result<Option<R>, WaapiError>
-    where
-        R: DeserializeOwned,
-    {
-        self.call(uri, None::<serde_json::Value>, None::<serde_json::Value>)
-            .await
-    }
-
-    /// Subscribe to a topic, returning an event stream and a handle.
-    ///
-    /// The caller should consume the returned receiver in a separate task to avoid
-    /// backpressure buildup. To unsubscribe: call [SubscriptionHandle::unsubscribe]
-    /// on the returned handle, or drop it (auto-cancels in background).
-    ///
-    /// ---
-    ///
-    /// 订阅主题，返回事件流与句柄。
-    ///
-    /// 调用方应在单独 task 中消费返回的 receiver，否则会积压。
-    /// 取消订阅：调用返回的 [SubscriptionHandle::unsubscribe]，或 drop handle（会在后台自动取消）。
-    pub async fn subscribe(
+    /// Internal subscribe: returns handle and receiver. Used by [WaapiClientSync] to bridge events.
+    pub(crate) async fn subscribe_inner(
         &self,
         topic: &str,
+        options: Option<Value>,
     ) -> Result<
         (
             SubscriptionHandle,
@@ -327,13 +286,14 @@ impl WaapiClient {
         ),
         WaapiError,
     > {
+        let options = options.map(value_to_wamp_dict).transpose()?;
         let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
         let (sub_id, queue) = client
             .lock()
             .await
             .as_ref()
             .ok_or(WaapiError::Disconnected)?
-            .subscribe(topic)
+            .subscribe(topic, options)
             .await?;
         self.subscription_ids
             .lock()
@@ -356,32 +316,46 @@ impl WaapiClient {
     /// The callback runs in a dedicated task and does not block the event loop.
     /// The returned handle is used to cancel; on drop it aborts the task and auto-unsubscribes.
     ///
+    /// # Parameters
+    ///
+    /// * `topic` - WAMP topic URI, e.g. `"ak.wwise.ui.selectionChanged"` or `ak::wwise::ui::SELECTION_CHANGED`
+    /// * `options` - Optional subscription options (`serde_json::Value`), e.g. filtering or return fields
+    /// * `callback` - Callback invoked on each event with `(args, kwargs)`
+    ///
     /// ---
     ///
     /// 订阅主题并绑定回调：内部 spawn 一个 task 循环接收事件并调用 `callback(args, kwargs)`。
     ///
     /// 回调在独立 task 中执行，不阻塞事件循环。返回的句柄用于取消订阅；drop 时会 abort 该 task 并自动 unsubscribe。
-    pub async fn subscribe_with_callback<F>(
+    ///
+    /// # 参数
+    ///
+    /// * `topic` - WAMP 主题 URI，如 `"ak.wwise.ui.selectionChanged"` 或 `ak::wwise::ui::SELECTION_CHANGED`
+    /// * `options` - 可选的订阅选项（`serde_json::Value`），如过滤、返回字段等
+    /// * `callback` - 每次事件触发时调用的回调，参数为 `(args, kwargs)`
+    pub async fn subscribe<F>(
         &self,
         topic: &str,
+        options: Option<Value>,
         callback: F,
     ) -> Result<SubscriptionHandle, WaapiError>
     where
         F: Fn(Option<wamp_async::WampArgs>, Option<WampKwArgs>) + Send + Sync + 'static,
     {
+        let options = options.map(value_to_wamp_dict).transpose()?;
         let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
         let (sub_id, mut queue) = client
             .lock()
             .await
             .as_ref()
             .ok_or(WaapiError::Disconnected)?
-            .subscribe(topic)
+            .subscribe(topic, options)
             .await?;
         self.subscription_ids
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(sub_id);
-        debug!("Subscribed to {topic} with callback (sub_id={sub_id})");
+        debug!("Subscribed to {topic} (sub_id={sub_id})");
         let recv_task = tokio::spawn(async move {
             while let Some((_, args, kwargs)) = queue.recv().await {
                 callback(args, kwargs);
@@ -521,15 +495,14 @@ impl Drop for WaapiClient {
     }
 }
 
-/// Sync subscription handle: cancels subscriptions created by
-/// [WaapiClientSync::subscribe] or [WaapiClientSync::subscribe_with_callback].
+/// Sync subscription handle: cancels subscriptions created by [WaapiClientSync::subscribe].
 ///
 /// Calls [SubscriptionHandleSync::unsubscribe] or drop to cancel and wait for the bridge thread.
 /// **Do not drop this handle inside a callback — it may deadlock.**
 ///
 /// ---
 ///
-/// 同步订阅句柄：用于取消通过 [WaapiClientSync::subscribe] 或 [WaapiClientSync::subscribe_with_callback] 创建的订阅。
+/// 同步订阅句柄：用于取消通过 [WaapiClientSync::subscribe] 创建的订阅。
 ///
 /// 调用 [SubscriptionHandleSync::unsubscribe] 或 drop 时取消订阅并等待桥接线程结束。
 /// **注意：不要在回调内部 drop 本句柄，否则可能死锁。**
@@ -654,11 +627,11 @@ impl WaapiClientSync {
     ///
     /// # Parameters
     ///
-    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"`
-    /// * `args` - Optional keyword arguments (`impl Serialize`)
-    /// * `options` - Optional options dict (`impl Serialize`, may differ from `args` type)
+    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"` or `ak::wwise::core::GET_INFO`
+    /// * `args` - Optional keyword arguments (`serde_json::Value`)
+    /// * `options` - Optional options dict (`serde_json::Value`, may differ from `args`)
     ///
-    /// Returns `Option<R>` where `R: DeserializeOwned`.
+    /// Returns `Option<Value>`: WAAPI kwargs deserialized as JSON; `None` when no result.
     ///
     /// ---
     ///
@@ -666,82 +639,19 @@ impl WaapiClientSync {
     ///
     /// # 参数
     ///
-    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"`
-    /// * `args` - 可选的关键字参数（`impl Serialize`）
-    /// * `options` - 可选的选项字典（`impl Serialize`，可与 args 不同类型）
+    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"` 或 `ak::wwise::core::GET_INFO`
+    /// * `args` - 可选的关键字参数（`serde_json::Value`）
+    /// * `options` - 可选的选项字典（`serde_json::Value`，可与 args 不同）
     ///
-    /// 返回 `Option<R>`，`R` 需满足 `DeserializeOwned`。
-    pub fn call<R>(
+    /// 返回 `Option<Value>`：WAAPI kwargs 反序列化为 JSON；无结果时为 `None`。
+    pub fn call(
         &self,
         uri: &str,
-        args: Option<impl Serialize>,
-        options: Option<impl Serialize>,
-    ) -> Result<Option<R>, WaapiError>
-    where
-        R: DeserializeOwned,
-    {
+        args: Option<Value>,
+        options: Option<Value>,
+    ) -> Result<Option<Value>, WaapiError> {
         let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
         self.runtime.block_on(client.call(uri, args, options))
-    }
-
-    /// Convenience no-args call, equivalent to `call(uri, None, None)`.
-    /// Specify the return type via turbofish, e.g. `call_no_args::<serde_json::Value>(uri)`.
-    ///
-    /// ---
-    ///
-    /// 无参便捷调用，等价于 `call(uri, None, None)`；返回类型由泛型指定，如 `call_no_args::<serde_json::Value>(uri)`。
-    pub fn call_no_args<R>(&self, uri: &str) -> Result<Option<R>, WaapiError>
-    where
-        R: DeserializeOwned,
-    {
-        let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
-        self.runtime.block_on(client.call_no_args(uri))
-    }
-
-    /// Subscribe to a topic, returning a sync handle and a sync channel receiver.
-    /// Use `recv()` or `recv_timeout()` on the receiver to collect events.
-    ///
-    /// To unsubscribe: call [SubscriptionHandleSync::unsubscribe] or drop the handle.
-    /// Do not drop the handle inside a callback.
-    ///
-    /// ---
-    ///
-    /// 订阅主题，返回同步句柄与同步 channel 的 receiver；从 receiver 上 `recv()` 或 `recv_timeout()` 收取事件。
-    ///
-    /// 取消订阅：调用返回的 [SubscriptionHandleSync::unsubscribe]，或 drop 句柄。不要在回调中 drop 句柄。
-    pub fn subscribe(
-        &self,
-        topic: &str,
-    ) -> Result<
-        (SubscriptionHandleSync, mpsc::Receiver<SubscribeEvent>),
-        WaapiError,
-    > {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or(WaapiError::Disconnected)?;
-        let (inner, mut async_rx) = self
-            .runtime
-            .block_on(client.subscribe(topic))?;
-        let (sync_tx, sync_rx) = mpsc::channel();
-        let (id_tx, id_rx) = mpsc::channel();
-        let runtime = Arc::clone(&self.runtime);
-        let bridge_join = thread::spawn(move || {
-            let _ = id_tx.send(thread::current().id());
-            while let Some(ev) = runtime.block_on(async_rx.recv()) {
-                if sync_tx.send(ev).is_err() {
-                    break;
-                }
-            }
-        });
-        let bridge_thread_id = id_rx.recv().ok();
-        let handle = SubscriptionHandleSync {
-            runtime: Arc::clone(&self.runtime),
-            inner: Some(inner),
-            bridge_join: Some(bridge_join),
-            bridge_thread_id,
-        };
-        Ok((handle, sync_rx))
     }
 
     /// Subscribe to a topic with a callback: receives events in a dedicated thread
@@ -750,14 +660,27 @@ impl WaapiClientSync {
     /// To unsubscribe: call [SubscriptionHandleSync::unsubscribe] or drop the handle.
     /// Do not drop the handle inside the callback.
     ///
+    /// # Parameters
+    ///
+    /// * `topic` - WAMP topic URI, e.g. `"ak.wwise.ui.selectionChanged"` or `ak::wwise::ui::SELECTION_CHANGED`
+    /// * `options` - Optional subscription options (`serde_json::Value`), e.g. filtering or return fields
+    /// * `callback` - Callback invoked on each event with `(args, kwargs)`
+    ///
     /// ---
     ///
     /// 订阅主题并绑定回调：在独立线程中接收事件并同步调用 `callback(args, kwargs)`。
     ///
     /// 取消订阅：调用返回的 [SubscriptionHandleSync::unsubscribe]，或 drop 句柄。不要在 callback 内 drop 句柄。
-    pub fn subscribe_with_callback<F>(
+    ///
+    /// # 参数
+    ///
+    /// * `topic` - WAMP 主题 URI，如 `"ak.wwise.ui.selectionChanged"` 或 `ak::wwise::ui::SELECTION_CHANGED`
+    /// * `options` - 可选的订阅选项（`serde_json::Value`），如过滤、返回字段等
+    /// * `callback` - 每次事件触发时调用的回调，参数为 `(args, kwargs)`
+    pub fn subscribe<F>(
         &self,
         topic: &str,
+        options: Option<Value>,
         callback: F,
     ) -> Result<SubscriptionHandleSync, WaapiError>
     where
@@ -769,7 +692,7 @@ impl WaapiClientSync {
             .ok_or(WaapiError::Disconnected)?;
         let (inner, mut async_rx) = self
             .runtime
-            .block_on(client.subscribe(topic))?;
+            .block_on(client.subscribe_inner(topic, options))?;
         let (id_tx, id_rx) = mpsc::channel();
         let runtime = Arc::clone(&self.runtime);
         let bridge_join = thread::spawn(move || {

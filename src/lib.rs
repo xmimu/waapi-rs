@@ -13,8 +13,8 @@
 //! # Features
 //!
 //! - **Connect**: `WaapiClient::connect()` / `connect_with_url(url)`; sync client [WaapiClientSync] provides the same
-//! - **RPC**: `call(uri, args, options)`, `call_no_args(uri)`
-//! - **Subscribe**: `subscribe(topic)` returns an event stream, or `subscribe_with_callback(topic, callback)` binds a callback
+//! - **RPC**: `call(uri, args, options)`
+//! - **Subscribe**: `subscribe(topic, options, callback)` binds a callback for receiving events
 //! - **Cleanup**: connections and subscriptions auto-clean on Drop; explicit `disconnect` / `SubscriptionHandle::unsubscribe()` also available
 //!
 //! ---
@@ -22,8 +22,8 @@
 //! # 功能概览
 //!
 //! - **连接**：`WaapiClient::connect()` / `connect_with_url(url)`；同步客户端 [WaapiClientSync] 同样提供 `connect()` 与 `connect_with_url(url)`
-//! - **RPC 调用**：`call(uri, args, options)`、`call_no_args(uri)`
-//! - **订阅**：`subscribe(topic)` 返回事件流，或 `subscribe_with_callback(topic, callback)` 绑定回调
+//! - **RPC 调用**：`call(uri, args, options)`
+//! - **订阅**：`subscribe(topic, options, callback)` 绑定回调接收事件
 //! - **资源**：连接与订阅在 Drop 时自动清理，也可显式 `disconnect` / `SubscriptionHandle::unsubscribe()`
 //!
 //! # Examples / 示例
@@ -33,13 +33,12 @@
 //! 异步客户端 - 连接后调用 WAAPI 方法（如获取 Wwise 版本）：
 //!
 //! ```rust,no_run
-//! use serde_json::Value;
-//! use waapi_rs::WaapiClient;
+//! use waapi_rs::{ak, WaapiClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClient::connect().await?;
-//!     let result = client.call_no_args::<Value>("ak.wwise.core.getInfo").await?;
+//!     let result = client.call(ak::wwise::core::GET_INFO, None, None).await?;
 //!     if let Some(info) = result {
 //!         let version = info.get("version")
 //!             .and_then(|v| v.get("displayName"))
@@ -57,15 +56,15 @@
 //! 使用 `json!` 构造参数与选项进行 RPC 调用（如 WAQL 查询）：
 //!
 //! ```rust,no_run
-//! use serde_json::{json, Value};
-//! use waapi_rs::WaapiClient;
+//! use serde_json::json;
+//! use waapi_rs::{ak, WaapiClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClient::connect().await?;
 //!     let result = client
-//!         .call::<Value>(
-//!             "ak.wwise.core.object.get",
+//!         .call(
+//!             ak::wwise::core::OBJECT_GET,
 //!             Some(json!({ "waql": "$ from type Event" })),
 //!             Some(json!({ "return": ["id", "name", "type"] })),
 //!         )
@@ -83,13 +82,13 @@
 //! 订阅主题并用回调接收事件：
 //!
 //! ```rust,no_run
-//! use waapi_rs::WaapiClient;
+//! use waapi_rs::{ak, WaapiClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClient::connect().await?;
 //!     let handle = client
-//!         .subscribe_with_callback("ak.wwise.ui.selectionChanged", |_args, kwargs| {
+//!         .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_args, kwargs| {
 //!             println!("Selection changed: {:?}", kwargs);
 //!         })
 //!         .await?;
@@ -104,12 +103,11 @@
 //! 同步客户端（适用于非 async 代码或脚本）：
 //!
 //! ```rust,no_run
-//! use serde_json::Value;
-//! use waapi_rs::WaapiClientSync;
+//! use waapi_rs::{ak, WaapiClientSync};
 //!
 //! fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClientSync::connect()?;
-//!     let result = client.call_no_args::<Value>("ak.wwise.core.getInfo")?;
+//!     let result = client.call(ak::wwise::core::GET_INFO, None, None)?;
 //!     if let Some(info) = result {
 //!         println!("Info: {:?}", info);
 //!     }
@@ -118,18 +116,17 @@
 //! }
 //! ```
 //!
-//! # `call` constraints
+//! # `call` types
 //!
-//! The return type of `call` / `call_no_args` is `T: DeserializeOwned`
-//! (e.g. `serde_json::Value` or a custom struct), returning `Option<T>`.
-//! `args` / `options` only need to be serializable (`impl Serialize`).
+//! `call` returns `Option<serde_json::Value>`: the WAAPI response as JSON.
+//! `args` / `options` are `Option<serde_json::Value>` (e.g. `Some(json!({...}))` or `None`).
 //!
 //! ---
 //!
-//! # call 约束
+//! # call 类型
 //!
-//! `call` / `call_no_args` 的返回值类型为 `T: DeserializeOwned`（如 `serde_json::Value`、自定义结构体），返回 `Option<T>`；
-//! `args` / `options` 仅需可序列化（`impl Serialize`）。
+//! `call` 返回 `Option<serde_json::Value>`：WAAPI 响应的 JSON 值。
+//! `args` / `options` 为 `Option<serde_json::Value>`（如 `Some(json!({...}))` 或 `None`）。
 
 mod args;
 mod client;
@@ -137,6 +134,5 @@ mod uris;
 pub use uris::ak;
 
 pub use client::{
-    SubscribeEvent, SubscriptionHandle, SubscriptionHandleSync, WaapiClient, WaapiClientSync,
-    WaapiError,
+    SubscriptionHandle, SubscriptionHandleSync, WaapiClient, WaapiClientSync, WaapiError,
 };

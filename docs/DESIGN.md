@@ -44,22 +44,20 @@ flowchart LR
 
 | Type | Responsibility |
 |------|---------------|
-| **WaapiClient** | Async connect (`connect` / `connect_with_url`), RPC (`call` / `call_no_args`), subscriptions (`subscribe` / `subscribe_with_callback`), lifecycle management (`disconnect`, `cleanup`); shareable across tasks (internal `Arc` + `Mutex`). |
-| **WaapiClientSync** | Creates and holds a multi-threaded runtime; exposes sync `connect` / `connect_with_url`, `call` / `call_no_args`, `subscribe` / `subscribe_with_callback`, `is_connected`, `disconnect`; for non-async environments. |
-| **SubscriptionHandle** | Holds subscription ID, shared `Arc` with client, and optional `recv_task` (present when `subscribe_with_callback` is used); `unsubscribe()` cancels explicitly, `Drop` spawns async cancel in background to avoid blocking. |
+| **WaapiClient** | Async connect (`connect` / `connect_with_url`), RPC (`call`), subscriptions (`subscribe(topic, options, callback)`), lifecycle management (`disconnect`, `cleanup`); shareable across tasks (internal `Arc` + `Mutex`). |
+| **WaapiClientSync** | Creates and holds a multi-threaded runtime; exposes sync `connect` / `connect_with_url`, `call`, `subscribe(topic, options, callback)`, `is_connected`, `disconnect`; for non-async environments. |
+| **SubscriptionHandle** | Holds subscription ID, shared `Arc` with client, and `recv_task` for the callback loop; `unsubscribe()` cancels explicitly, `Drop` spawns async cancel in background to avoid blocking. |
 | **SubscriptionHandleSync** | Cancels subscriptions created by the sync client; `unsubscribe()` or drop cancels and joins the bridge thread. **Do not drop inside a callback — may deadlock.** |
 
 ### RPC and URI Constants
 
-- **call generics**: `call<T>(uri, args, options)` / `call_no_args<T>(uri)` — generic `T` is the **return value** deserialization type, requiring `DeserializeOwned` (e.g. `serde_json::Value` or a custom struct). Returns `Result<Option<T>, Error>`: on success, WAAPI kwargs are deserialized into `T`; `None` if no result. `args`/`options` are serializable types (typically `Value` or `impl Serialize`).
+- **call**: `call(uri, args, options)` — returns `Result<Option<Value>, Error>`: on success, WAAPI kwargs are returned as `serde_json::Value`; `None` if no result. `args`/`options` are `Option<serde_json::Value>` (e.g. `Some(json!({...}))` or `None`).
 - **URI constants (uris)**: `src/uris.rs` organizes nested modules by WAAPI URI path (`ak::soundengine`, `ak::wwise::core`, `ak::wwise::debug`, `ak::wwise::ui`, `ak::wwise::waapi`), each providing `pub const XXX: &str = "ak.xxx.xxx"`. The library re-exports via `pub use uris::ak`; users only need `use waapi_rs::ak` and write paths from `ak::` (e.g. `ak::wwise::core::GET_INFO`), matching C++ WAAPI / official URI naming for easy autocomplete and avoiding hand-written strings.
 
 ### Subscription Model
 
-- **`subscribe(topic)`**: returns `(SubscriptionHandle, UnboundedReceiver<SubscribeEvent>)`. Callers should consume the receiver in a separate task; backpressure is buffered by the unbounded channel. Cancel by calling `handle.unsubscribe()` or dropping the handle.
-- **`subscribe_with_callback(topic, callback)`**: internally spawns a task that loops `recv()` and invokes `callback(args, kwargs)`; the callback runs in a dedicated task without blocking the event loop. On cancel, `SubscriptionHandle` aborts the task and unsubscribes.
-- In both cases, dropping `SubscriptionHandle` removes from the client's `subscription_ids` and runs `unsubscribe` in the background, avoiding `.await` inside `Drop`.
-- **Sync client**: `WaapiClientSync::subscribe(topic)` returns `(SubscriptionHandleSync, mpsc::Receiver<SubscribeEvent>)`; `subscribe_with_callback(topic, callback)` returns `SubscriptionHandleSync`. Cancel by calling `unsubscribe()` or dropping the handle. **Do not drop `SubscriptionHandleSync` inside a callback — may deadlock.**
+- **`subscribe(topic, options, callback)`**: internally spawns a task that receives events and invokes `callback(args, kwargs)`; the callback runs in a dedicated task without blocking the event loop. Returns `SubscriptionHandle`. On cancel, `SubscriptionHandle` aborts the task and unsubscribes. Dropping `SubscriptionHandle` removes from the client's `subscription_ids` and runs `unsubscribe` in the background, avoiding `.await` inside `Drop`.
+- **Sync client**: `WaapiClientSync::subscribe(topic, options, callback)` returns `SubscriptionHandleSync`. Cancel by calling `unsubscribe()` or dropping the handle. **Do not drop `SubscriptionHandleSync` inside a callback — may deadlock.**
 
 ### Resource and Lifecycle
 
@@ -77,8 +75,8 @@ flowchart LR
 | Python (waapi-client-python) | waapi-rs |
 |------------------------------|----------|
 | `WaapiClient()` / `connect()` | `WaapiClient::connect().await` or `WaapiClientSync::connect()` |
-| `client.call(uri, options=...)` | `client.call::<T>(uri, args, options)` or `call_no_args::<T>(uri)`; generic `T` is the return type, returns `Result<Option<T>, Error>`; URI via constants like `ak::wwise::core::GET_INFO` |
-| `client.subscribe(topic, callback)` | `subscribe_with_callback(topic, \|args, kwargs\| { ... })` or `subscribe(topic)` + consume receiver manually; topic via `ak::wwise::ui::SELECTION_CHANGED` etc. |
+| `client.call(uri, options=...)` | `client.call(uri, args, options)`; returns `Result<Option<Value>, Error>`; URI via constants like `ak::wwise::core::GET_INFO` |
+| `client.subscribe(topic, callback)` | `subscribe(topic, options, \|args, kwargs\| { ... })`; topic via `ak::wwise::ui::SELECTION_CHANGED` etc. |
 | `handler.unsubscribe()` | `handle.unsubscribe().await` or drop `SubscriptionHandle` |
 | `client.disconnect()` | `client.disconnect().await` or drop `WaapiClient` |
 
@@ -132,22 +130,20 @@ flowchart LR
 
 | 类型 | 职责 |
 |------|------|
-| **WaapiClient** | 异步连接（`connect` / `connect_with_url`）、RPC（`call` / `call_no_args`）、订阅（`subscribe` / `subscribe_with_callback`）、生命周期管理（`disconnect`、`cleanup`）；可在多任务间共享（内部用 `Arc` + `Mutex`）。 |
-| **WaapiClientSync** | 内部创建并持有多线程 runtime，对外提供同步的 `connect` / `connect_with_url`、`call` / `call_no_args`、`subscribe` / `subscribe_with_callback`、`is_connected`、`disconnect`；适用于非 async 环境。 |
-| **SubscriptionHandle** | 持有订阅 ID、与 client 共享的 `Arc`、以及可选的 `recv_task`（`subscribe_with_callback` 时存在）；`unsubscribe()` 显式取消，`Drop` 时也会在后台 spawn 异步取消，避免阻塞。 |
+| **WaapiClient** | 异步连接（`connect` / `connect_with_url`）、RPC（`call`）、订阅（`subscribe(topic, options, callback)`）、生命周期管理（`disconnect`、`cleanup`）；可在多任务间共享（内部用 `Arc` + `Mutex`）。 |
+| **WaapiClientSync** | 内部创建并持有多线程 runtime，对外提供同步的 `connect` / `connect_with_url`、`call`、`subscribe(topic, options, callback)`、`is_connected`、`disconnect`；适用于非 async 环境。 |
+| **SubscriptionHandle** | 持有订阅 ID、与 client 共享的 `Arc`、以及回调循环的 `recv_task`；`unsubscribe()` 显式取消，`Drop` 时也会在后台 spawn 异步取消，避免阻塞。 |
 | **SubscriptionHandleSync** | 用于取消同步客户端创建的订阅；`unsubscribe()` 或 drop 时取消订阅并 join 桥接线程；**禁止在回调内部 drop，否则可能死锁。** |
 
 ### RPC 与 URI 常量
 
-- **call 泛型**：`call<T>(uri, args, options)`、`call_no_args<T>(uri)` 的泛型 `T` 表示**返回值**的反序列化类型，需满足 `DeserializeOwned`（如 `serde_json::Value` 或自定义结构体）。返回 `Result<Option<T>, Error>`：成功时 WAAPI 的 kwargs 反序列化为 `T`，无结果时为 `None`；args/options 仍为可序列化类型（通常 `Value` 或 `impl Serialize`）。
+- **call**：`call(uri, args, options)` 返回 `Result<Option<Value>, Error>`：成功时 WAAPI 的 kwargs 以 `serde_json::Value` 返回，无结果时为 `None`；`args`/`options` 为 `Option<serde_json::Value>`（如 `Some(json!({...}))` 或 `None`）。
 - **URI 常量（uris）**：`src/uris.rs` 中按 WAAPI URI 路径组织嵌套模块（`ak::soundengine`、`ak::wwise::core`、`ak::wwise::debug`、`ak::wwise::ui`、`ak::wwise::waapi`），每层提供 `pub const XXX: &str = "ak.xxx.xxx"`。库通过 `pub use uris::ak` 重导出，用户只需 `use waapi_rs::ak`，调用时从 `ak::` 写路径（如 `ak::wwise::core::GET_INFO`），与 C++ WAAPI / 官方 URI 命名一致，便于补全与避免手写字符串。
 
 ### 订阅模型
 
-- **`subscribe(topic)`**：返回 `(SubscriptionHandle, UnboundedReceiver<SubscribeEvent>)`。调用方需在单独 task 中消费 receiver；背压由 unbounded channel 缓冲。取消方式：调用 `handle.unsubscribe()` 或 drop handle。
-- **`subscribe_with_callback(topic, callback)`**：内部 spawn 一个 task 循环 `recv()` 并调用 `callback(args, kwargs)`；回调在独立 task 中运行，不阻塞事件循环。取消时 `SubscriptionHandle` 会 abort 该 task 并 unsubscribe。
-- 两种方式下，drop `SubscriptionHandle` 都会从 client 的 `subscription_ids` 中移除并在后台执行 `unsubscribe`，避免在 `Drop` 里做 `.await`。
-- **同步客户端**：`WaapiClientSync::subscribe(topic)` 返回 `(SubscriptionHandleSync, mpsc::Receiver<SubscribeEvent>)`，`subscribe_with_callback(topic, callback)` 返回 `SubscriptionHandleSync`。取消方式为调用 `unsubscribe()` 或 drop 句柄。**注意：不要在回调内部 drop `SubscriptionHandleSync`，否则可能死锁。**
+- **`subscribe(topic, options, callback)`**：内部 spawn 一个 task 接收事件并调用 `callback(args, kwargs)`；回调在独立 task 中运行，不阻塞事件循环。返回 `SubscriptionHandle`。取消时 `SubscriptionHandle` 会 abort 该 task 并 unsubscribe。drop `SubscriptionHandle` 会从 client 的 `subscription_ids` 中移除并在后台执行 `unsubscribe`，避免在 `Drop` 里做 `.await`。
+- **同步客户端**：`WaapiClientSync::subscribe(topic, options, callback)` 返回 `SubscriptionHandleSync`。取消方式为调用 `unsubscribe()` 或 drop 句柄。**注意：不要在回调内部 drop `SubscriptionHandleSync`，否则可能死锁。**
 
 ### 资源与生命周期
 
@@ -165,8 +161,8 @@ flowchart LR
 | Python (waapi-client-python) | waapi-rs |
 |------------------------------|----------|
 | `WaapiClient()` / `connect()` | `WaapiClient::connect().await` 或 `WaapiClientSync::connect()` |
-| `client.call(uri, options=...)` | `client.call::<T>(uri, args, options)` 或 `call_no_args::<T>(uri)`，泛型 `T` 为返回值类型，返回 `Result<Option<T>, Error>`；URI 可用常量如 `ak::wwise::core::GET_INFO` |
-| `client.subscribe(topic, callback)` | `subscribe_with_callback(topic, \|args, kwargs\| { ... })` 或 `subscribe(topic)` + 自行消费 receiver；主题可用 `ak::wwise::ui::SELECTION_CHANGED` 等 |
+| `client.call(uri, options=...)` | `client.call(uri, args, options)`，返回 `Result<Option<Value>, Error>`；URI 可用常量如 `ak::wwise::core::GET_INFO` |
+| `client.subscribe(topic, callback)` | `subscribe(topic, options, \|args, kwargs\| { ... })`；主题可用 `ak::wwise::ui::SELECTION_CHANGED` 等 |
 | `handler.unsubscribe()` | `handle.unsubscribe().await` 或 drop `SubscriptionHandle` |
 | `client.disconnect()` | `client.disconnect().await` 或 drop `WaapiClient` |
 
