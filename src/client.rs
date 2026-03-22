@@ -12,6 +12,7 @@
 //! 连接生命周期：`connect` 后加入默认 realm，断开时先取消所有订阅、再 leave_realm、再 disconnect。
 //! 订阅通过 [SubscriptionHandle] 管理，显式 [SubscriptionHandle::unsubscribe] 或 drop 时自动取消；同步客户端下由 [SubscriptionHandleSync] 管理。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -143,6 +144,12 @@ pub struct WaapiClient {
     ///
     /// 当前活跃的订阅 ID，disconnect 时统一 unsubscribe。
     subscription_ids: Arc<StdMutex<Vec<WampId>>>,
+    /// Connection liveness flag: set to `false` when cleanup begins or the event loop terminates
+    /// (e.g. Wwise process exit / network drop). Shared with the event-loop monitor task.
+    ///
+    /// 连接存活标志：cleanup 开始时或事件循环终止时（如 Wwise 进程退出/网络断开）置 `false`。
+    /// 与事件循环监控 task 共享。
+    connected: Arc<AtomicBool>,
 }
 
 /// Async cleanup from taken fields: unsubscribe all → leave_realm → disconnect → abort event loop.
@@ -158,21 +165,44 @@ async fn do_cleanup(
     client_arc: Option<Arc<TokioMutex<Option<Client<'static>>>>>,
     subscription_ids: Arc<StdMutex<Vec<WampId>>>,
     event_loop: Option<tokio::task::JoinHandle<Result<(), WampError>>>,
+    connected: Arc<AtomicBool>,
 ) {
+    // Mark disconnected immediately so is_connected() reflects reality at once.
+    // 立即标记为断开，使 is_connected() 第一时间反映真实状态。
+    connected.store(false, Ordering::Release);
+
+    // If the event loop has already finished (e.g. Wwise crashed / network drop),
+    // the underlying WAMP channel is closed and calling unsubscribe/leave_realm/disconnect
+    // would panic inside wamp_async. Skip WAMP-level ops; only clear local state.
+    //
+    // 若事件循环已结束（如 Wwise 崩溃/网络断开），WAMP 底层 channel 已关闭，
+    // 继续调用 unsubscribe/leave_realm/disconnect 会在 wamp_async 内 panic。
+    // 跳过 WAMP 层操作，仅清理本地状态。
+    let wamp_alive = event_loop.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
+
     if let Some(arc) = client_arc {
         let ids: Vec<WampId> = {
             let mut guard = subscription_ids.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *guard)
         };
         let mut client_guard = arc.lock().await;
-        if let Some(ref mut c) = *client_guard {
-            for sub_id in ids {
-                let _ = c.unsubscribe(sub_id).await;
+        if wamp_alive {
+            if let Some(ref mut c) = *client_guard {
+                for sub_id in ids {
+                    let _ = c.unsubscribe(sub_id).await;
+                }
+                let _ = c.leave_realm().await;
             }
-            let _ = c.leave_realm().await;
-        }
-        if let Some(c) = client_guard.take() {
-            c.disconnect().await;
+            if let Some(c) = client_guard.take() {
+                c.disconnect().await;
+            }
+        } else {
+            // Drop the inner Client without WAMP calls; subsequent SubscriptionHandle
+            // drops will see None and skip network unsubscribe safely.
+            //
+            // 直接 drop 内层 Client，不执行 WAMP 调用；
+            // 后续 SubscriptionHandle drop 时看到 None，安全跳过网络退订。
+            client_guard.take();
         }
     }
 
@@ -216,7 +246,15 @@ impl WaapiClient {
         )
         .await?;
 
-        let handle = tokio::spawn(event_loop);
+        let connected = Arc::new(AtomicBool::new(true));
+        let connected_flag = Arc::clone(&connected);
+        let handle = tokio::spawn(async move {
+            let result = event_loop.await;
+            // Event loop terminated (normal disconnect or network/Wwise crash).
+            // 事件循环结束（正常断开或网络/Wwise 崩溃），立即更新连接标志。
+            connected_flag.store(false, Ordering::Release);
+            result
+        });
         client.join_realm(DEFAULT_REALM).await?;
         info!("Connected to WAAPI at {url}");
 
@@ -225,6 +263,7 @@ impl WaapiClient {
             client: Some(client),
             event_loop_handle: Some(handle),
             subscription_ids: Arc::new(StdMutex::new(Vec::new())),
+            connected,
         })
     }
 
@@ -371,19 +410,27 @@ impl WaapiClient {
         Ok(handle)
     }
 
-    /// Check whether the client is still logically connected.
+    /// Check whether the client is still connected.
     ///
-    /// Note: reflects local state only (whether `disconnect` has been called);
-    /// does not probe the underlying WebSocket.
+    /// Returns `false` if:
+    /// - [`disconnect`](WaapiClient::disconnect) has been called, or
+    /// - the event loop has terminated (e.g. Wwise process exit or network drop).
+    ///
+    /// Note: updated reactively when the event loop terminates; does not actively probe
+    /// the underlying WebSocket.
     ///
     /// ---
     ///
-    /// 检查客户端是否仍处于逻辑连接状态。
+    /// 检查客户端是否仍处于连接状态。
     ///
-    /// 注意：仅反映本地状态（是否调用过 `disconnect`），不检测底层 WebSocket 是否存活。
+    /// 以下情况返回 `false`：
+    /// - 已调用 [`disconnect`](WaapiClient::disconnect)，或
+    /// - 事件循环已终止（如 Wwise 进程退出或网络断开）。
+    ///
+    /// 注意：事件循环终止时被动更新，不主动探测底层 WebSocket 是否存活。
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.client.is_some()
+        self.client.is_some() && self.connected.load(Ordering::Acquire)
     }
 
     /// Explicitly disconnect.
@@ -410,6 +457,7 @@ impl WaapiClient {
             self.client.take(),
             Arc::clone(&self.subscription_ids),
             self.event_loop_handle.take(),
+            Arc::clone(&self.connected),
         )
         .await;
     }
@@ -482,11 +530,13 @@ impl Drop for WaapiClient {
             let client_arc = self.client.take();
             let event_loop = self.event_loop_handle.take();
             let subscription_ids = Arc::clone(&self.subscription_ids);
+            let connected = Arc::clone(&self.connected);
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 debug!("WaapiClient dropped, spawning async cleanup");
-                rt.spawn(do_cleanup(client_arc, subscription_ids, event_loop));
+                rt.spawn(do_cleanup(client_arc, subscription_ids, event_loop, connected));
             } else {
                 warn!("WaapiClient dropped without runtime, skipping graceful cleanup");
+                connected.store(false, Ordering::Release);
                 if let Some(h) = event_loop {
                     h.abort();
                 }
@@ -793,6 +843,7 @@ mod tests {
             client: None,
             event_loop_handle: None,
             subscription_ids: Arc::new(StdMutex::new(Vec::new())),
+            connected: Arc::new(AtomicBool::new(false)),
         };
         let sync_client = WaapiClientSync {
             runtime,
