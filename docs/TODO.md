@@ -30,10 +30,10 @@
 
 ## P2 — 最佳实践
 
-- [ ] **添加 CHANGELOG.md** — 记录版本变更历史
+- [x] **添加 CHANGELOG.md** — 已创建，记录 v0.1.0 和 v0.2.0 变更历史
 
-- [ ] **添加 CI（GitHub Actions）** — 自动运行 clippy / test / doc
+- [x] **添加 CI（GitHub Actions）** — 已添加 `.github/workflows/ci.yml`，自动运行 test / clippy / doc 三个 job
 
-- [ ] **检查 `cargo package --list`** — 确认打包内容正确，无多余文件
+- [x] **检查 `cargo package --list`** — 内容正确；`docs/TODO.md` 和 `.github/` 已通过 `exclude` 排除
 
-- [ ] **考虑添加 `exclude` 字段** — 排除 `docs/`、`examples/` 等非必要目录（如果不想包含在发布包中）
+- [x] **考虑添加 `exclude` 字段** — 已在 `Cargo.toml` 添加 `exclude = ["docs/TODO.md", ".github/"]`
