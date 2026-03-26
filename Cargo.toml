@@ -11,7 +11,7 @@ documentation = "https://docs.rs/waapi-rs"
 readme = "README.md"
 keywords = ["wwise", "waapi", "audio", "wamp", "gamedev"]
 categories = ["api-bindings", "multimedia::audio", "game-development"]
-authors = ["xmimu 1101588023@qq.com"]
+authors = ["xmimu <1101588023@qq.com>"]
 
 [dependencies]
 wamp_async = { git = "https://github.com/xmimu/wamp_async.git", branch = "dev" }
