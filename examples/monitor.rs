@@ -25,7 +25,7 @@ async fn main() {
                 //
                 // 订阅一个事件以演示接收事件并保持连接活跃。
                 let sub_result = client
-                    .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_, kwargs| {
+                    .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |kwargs| {
                         println!("Selection changed: {kwargs:#?}");
                     })
                     .await;

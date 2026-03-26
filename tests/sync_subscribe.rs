@@ -16,7 +16,7 @@ fn test_sync_subscribe() {
         }
     };
 
-    let handle = match client.subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_args, _kwargs| {})
+    let handle = match client.subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_kwargs| {})
     {
         Ok(h) => h,
         Err(e) => {

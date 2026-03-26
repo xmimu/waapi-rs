@@ -35,7 +35,7 @@ async fn main() {
         ak::wwise::ui::SELECTION_CHANGED
     );
     let handler = client
-        .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_args, kwargs| {
+        .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |kwargs| {
             println!("Selection changed: {kwargs:?}");
         })
         .await

@@ -10,7 +10,7 @@ A Rust client for the Wwise Authoring API (WAAPI), based on WAMP over WebSocket,
 - **Sync client** [`WaapiClientSync`](https://docs.rs/waapi-rs/): internally manages a tokio runtime, blocking calls; ideal for scripts or non-async code
 - **RPC calls**: `call(uri, args, options)` to invoke WAAPI methods, returning `Result<Option<Value>, Error>` where `Value` is `serde_json::Value`
 - **URI constants**: `waapi_rs::ak` provides nested modules and constants matching WAAPI URI paths (e.g. `ak::wwise::core::GET_INFO`, `ak::wwise::waapi::GET_TOPICS`), avoiding hand-written strings
-- **Topic subscriptions**: `subscribe(topic, options, callback)` binds a callback for receiving events; cancel via `SubscriptionHandle` / `SubscriptionHandleSync`; auto-cleaned on drop
+- **Topic subscriptions**: `subscribe(topic, options, callback)` binds a callback `|kwargs: Option<Value>|` for receiving events; cancel via `SubscriptionHandle` / `SubscriptionHandleSync`; auto-cleaned on drop
 - **Resource cleanup**: connections and subscriptions auto-disconnect/cancel on `Drop`; explicit `disconnect` / `unsubscribe` also available
 
 ### Prerequisites
@@ -21,11 +21,11 @@ A Rust client for the Wwise Authoring API (WAAPI), based on WAMP over WebSocket,
 
 ### Installation
 
-Add the dependency to `Cargo.toml` (currently a git dependency):
+Add the dependency to `Cargo.toml`:
 
 ```toml
 [dependencies]
-waapi-rs = { git = "https://github.com/xmimu/waapi-rs.git" }
+waapi-rs = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 

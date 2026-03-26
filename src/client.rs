@@ -1,7 +1,7 @@
 //! WAAPI client implementation: async [WaapiClient] and sync [WaapiClientSync].
 //!
 //! Connection lifecycle: after `connect`, joins the default realm; on disconnect,
-//! all subscriptions are cancelled first, then `leave_realm`, then `disconnect`.
+//! all subscriptions are cancelled first, then GOODBYE, then close.
 //! Subscriptions are managed via [SubscriptionHandle]; explicit [SubscriptionHandle::unsubscribe]
 //! or drop will cancel automatically. For sync clients, [SubscriptionHandleSync] is used.
 //!
@@ -9,22 +9,26 @@
 //!
 //! WAAPI 客户端实现：异步 [WaapiClient] 与同步 [WaapiClientSync]。
 //!
-//! 连接生命周期：`connect` 后加入默认 realm，断开时先取消所有订阅、再 leave_realm、再 disconnect。
-//! 订阅通过 [SubscriptionHandle] 管理，显式 [SubscriptionHandle::unsubscribe] 或 drop 时自动取消；同步客户端下由 [SubscriptionHandleSync] 管理。
+//! 连接生命周期：`connect` 后加入默认 realm，断开时先取消所有订阅、再发 GOODBYE、再关闭连接。
+//! 订阅通过 [SubscriptionHandle] 管理，显式 [SubscriptionHandle::unsubscribe] 或 drop 时自动取消；
+//! 同步客户端下由 [SubscriptionHandleSync] 管理。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::thread;
 
+use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::Mutex as TokioMutex;
-use wamp_async::{Client, ClientConfig, SerializerType, WampError, WampId, WampKwArgs};
+use tokio::sync::oneshot;
+use tokio::sync::{mpsc as async_mpsc, Mutex as TokioMutex};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use log::{debug, info, warn};
 
-use crate::args::{value_to_kwargs, value_to_wamp_dict, wamp_result_to_value};
+use crate::wamp;
 
 /// Default WAAPI WebSocket URL (default port for Wwise local Authoring API).
 ///
@@ -52,11 +56,16 @@ pub enum WaapiError {
     /// 客户端已断开连接。
     #[error("client already disconnected")]
     Disconnected,
-    /// WAMP protocol error.
+    /// WAMP protocol error (e.g. server returned ERROR message).
     ///
-    /// WAMP 协议层错误。
-    #[error("{0}")]
-    Wamp(#[from] WampError),
+    /// WAMP 协议层错误（如服务端返回 ERROR 消息）。
+    #[error("WAMP error: {0}")]
+    Wamp(String),
+    /// WebSocket error.
+    ///
+    /// WebSocket 层错误。
+    #[error("WebSocket error: {0}")]
+    WebSocket(#[from] Box<tokio_tungstenite::tungstenite::Error>),
     /// Serialization / deserialization error.
     ///
     /// 序列化/反序列化错误。
@@ -69,397 +78,254 @@ pub enum WaapiError {
     Io(#[from] std::io::Error),
 }
 
-/// Subscription event payload: `(PublicationId, args, kwargs)`.
-///
-/// Received from a receiver or callback; typically parse event content from
-/// `args` / `kwargs`. `PublicationId` can be used for deduplication or logging.
-///
-/// ---
-///
-/// 订阅事件 payload：`(PublicationId, args, kwargs)`。
-///
-/// 从 receiver 或回调中收到；通常使用 `args` / `kwargs` 解析事件内容，PublicationId 可用于去重或日志。
-pub type SubscribeEvent = (WampId, Option<wamp_async::WampArgs>, Option<WampKwArgs>);
+// ── 内部类型别名 ────────────────────────────────────────────────
+
+type CallResult = Result<Option<Value>, WaapiError>;
+type SubResult = Result<u64, WaapiError>;
+type UnsubResult = Result<(), WaapiError>;
+
+/// 订阅事件 payload：`(pub_id, kwargs)`
+pub type EventPayload = (u64, Option<Value>);
+
+// ── 内部连接状态 ─────────────────────────────────────────────────
+
+type WsSink = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    Message,
+>;
+
+struct WampConn {
+    ws_tx: TokioMutex<WsSink>,
+    pending_calls: StdMutex<HashMap<u64, oneshot::Sender<CallResult>>>,
+    pending_subs: StdMutex<HashMap<u64, oneshot::Sender<SubResult>>>,
+    pending_unsubs: StdMutex<HashMap<u64, oneshot::Sender<UnsubResult>>>,
+    event_senders: StdMutex<HashMap<u64, async_mpsc::UnboundedSender<EventPayload>>>,
+    next_id: AtomicU64,
+}
+
+impl WampConn {
+    fn new(sink: WsSink) -> Self {
+        Self {
+            ws_tx: TokioMutex::new(sink),
+            pending_calls: StdMutex::new(HashMap::new()),
+            pending_subs: StdMutex::new(HashMap::new()),
+            pending_unsubs: StdMutex::new(HashMap::new()),
+            event_senders: StdMutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+
+    fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    async fn send(&self, text: String) -> Result<(), WaapiError> {
+        self.ws_tx
+            .lock()
+            .await
+            .send(Message::Text(text.into()))
+            .await
+            .map_err(|e| WaapiError::WebSocket(Box::new(e)))
+    }
+}
+
+// ── 事件循环 ──────────────────────────────────────────────────────
+
+type WsStream = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+async fn run_event_loop(
+    conn: Arc<WampConn>,
+    mut ws_rx: futures_util::stream::SplitStream<WsStream>,
+    connected: Arc<AtomicBool>,
+) {
+    while let Some(msg) = ws_rx.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Some(wamp_msg) = wamp::parse(&text) {
+                    dispatch(&conn, wamp_msg);
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
+        }
+    }
+    connected.store(false, Ordering::Release);
+    // 连接断开时，唤醒所有等待中的 pending futures 并报错
+    drain_pending(&conn);
+}
+
+fn dispatch(conn: &WampConn, msg: wamp::WampMessage) {
+    match msg {
+        wamp::WampMessage::Result { request_id, kwargs } => {
+            if let Some(tx) = conn
+                .pending_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id)
+            {
+                let _ = tx.send(Ok(kwargs));
+            }
+        }
+        wamp::WampMessage::Error {
+            request_type,
+            request_id,
+            error,
+        } => {
+            let err_str = error.clone();
+            // CALL error (type 48)
+            if request_type == 48 {
+                if let Some(tx) = conn
+                    .pending_calls
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_id)
+                {
+                    let _ = tx.send(Err(WaapiError::Wamp(err_str)));
+                    return;
+                }
+            }
+            // SUBSCRIBE error (type 32)
+            if request_type == 32 {
+                if let Some(tx) = conn
+                    .pending_subs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_id)
+                {
+                    let _ = tx.send(Err(WaapiError::Wamp(error)));
+                    return;
+                }
+            }
+            // UNSUBSCRIBE error (type 34)
+            if request_type == 34 {
+                if let Some(tx) = conn
+                    .pending_unsubs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&request_id)
+                {
+                    let _ = tx.send(Err(WaapiError::Wamp(error)));
+                }
+            }
+        }
+        wamp::WampMessage::Subscribed {
+            request_id,
+            sub_id,
+        } => {
+            if let Some(tx) = conn
+                .pending_subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id)
+            {
+                let _ = tx.send(Ok(sub_id));
+            }
+        }
+        wamp::WampMessage::Unsubscribed { request_id } => {
+            if let Some(tx) = conn
+                .pending_unsubs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&request_id)
+            {
+                let _ = tx.send(Ok(()));
+            }
+        }
+        wamp::WampMessage::Event {
+            sub_id,
+            pub_id,
+            kwargs,
+        } => {
+            let senders = conn
+                .event_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tx) = senders.get(&sub_id) {
+                let _ = tx.send((pub_id, kwargs));
+            }
+        }
+        wamp::WampMessage::Goodbye | wamp::WampMessage::Welcome { .. } => {}
+    }
+}
+
+/// 连接断开时，向所有等待中的 pending futures 发送 Disconnected 错误。
+fn drain_pending(conn: &WampConn) {
+    let calls: Vec<_> = conn
+        .pending_calls
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .collect();
+    for (_, tx) in calls {
+        let _ = tx.send(Err(WaapiError::Disconnected));
+    }
+    let subs: Vec<_> = conn
+        .pending_subs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .collect();
+    for (_, tx) in subs {
+        let _ = tx.send(Err(WaapiError::Disconnected));
+    }
+    let unsubs: Vec<_> = conn
+        .pending_unsubs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .drain()
+        .collect();
+    for (_, tx) in unsubs {
+        let _ = tx.send(Err(WaapiError::Disconnected));
+    }
+}
+
+// ── 连接握手辅助 ─────────────────────────────────────────────────
+
+/// 从 WebSocket 流读取第一条消息，期望是 WELCOME，否则返回错误。
+async fn read_welcome(
+    ws_rx: &mut futures_util::stream::SplitStream<WsStream>,
+) -> Result<u64, WaapiError> {
+    loop {
+        match ws_rx.next().await {
+            Some(Ok(Message::Text(text))) => {
+                if let Some(wamp::WampMessage::Welcome { session_id }) = wamp::parse(&text) {
+                    return Ok(session_id);
+                }
+                return Err(WaapiError::Wamp(format!("expected WELCOME, got: {text}")));
+            }
+            Some(Ok(_)) => continue, // 忽略非文本帧（如 Ping）
+            Some(Err(e)) => return Err(WaapiError::WebSocket(Box::new(e))),
+            None => return Err(WaapiError::Disconnected),
+        }
+    }
+}
+
+// ── 公共 API ──────────────────────────────────────────────────────
 
 /// Subscription handle: used to cancel a subscription; automatically unsubscribes
 /// in the background on drop.
 ///
-/// Holds a recv-loop task that will be aborted on unsubscribe or drop.
-///
 /// ---
 ///
 /// 订阅句柄：用于取消订阅；drop 时会自动在后台执行 unsubscribe。
-///
-/// 内部持有一个 recv 循环 task，unsubscribe 或 drop 时会先 abort 该 task。
 pub struct SubscriptionHandle {
-    sub_id: WampId,
-    client: Arc<TokioMutex<Option<Client<'static>>>>,
-    subscription_ids: Arc<StdMutex<Vec<WampId>>>,
+    sub_id: u64,
+    conn: Arc<WampConn>,
+    subscription_ids: Arc<StdMutex<Vec<u64>>>,
     recv_task: Option<tokio::task::JoinHandle<()>>,
     is_unsubscribed: bool,
 }
 
-/// Marks as unsubscribed; returns whether this is the first time
-/// (true = should proceed with network unsubscribe).
-///
-/// ---
-///
-/// 标记为已退订，返回本次是否首次标记（true 表示应继续执行网络退订）。
 fn mark_unsubscribed(flag: &mut bool) -> bool {
     if *flag {
         false
     } else {
         *flag = true;
         true
-    }
-}
-
-/// Async WAAPI client.
-///
-/// Provides async access to the Wwise Authoring API (WAAPI);
-/// can be shared across tasks (internal Arc + Mutex).
-///
-/// The client makes a best-effort cleanup on Drop, but spawned async tasks
-/// are not guaranteed to finish before process exit.
-/// **It is recommended to call [`disconnect`](WaapiClient::disconnect) explicitly**
-/// for graceful shutdown.
-///
-/// ---
-///
-/// WAAPI 异步客户端。
-///
-/// 提供异步接口访问 Wwise Authoring API (WAAPI)；可在多任务间共享使用（内部 Arc + Mutex）。
-///
-/// 客户端在 Drop 时会尽力清理资源，但 spawn 的异步任务不保证在进程退出前完成，
-/// **建议显式调用 [`disconnect`](WaapiClient::disconnect)** 以确保优雅关闭。
-pub struct WaapiClient {
-    /// Outer Option for take() during cleanup/disconnect;
-    /// inner Option (inside Mutex) for take() to call `Client::disconnect(self)`.
-    ///
-    /// 外层 Option 供 cleanup/disconnect 时 take() 转移所有权；
-    /// 内层 Option（Mutex 内）供 disconnect 逻辑 take() 出 Client 以调用 `Client::disconnect(self)`。
-    client: Option<Arc<TokioMutex<Option<Client<'static>>>>>,
-    event_loop_handle: Option<tokio::task::JoinHandle<Result<(), WampError>>>,
-    /// Active subscription IDs; all unsubscribed on disconnect.
-    ///
-    /// 当前活跃的订阅 ID，disconnect 时统一 unsubscribe。
-    subscription_ids: Arc<StdMutex<Vec<WampId>>>,
-    /// Connection liveness flag: set to `false` when cleanup begins or the event loop terminates
-    /// (e.g. Wwise process exit / network drop). Shared with the event-loop monitor task.
-    ///
-    /// 连接存活标志：cleanup 开始时或事件循环终止时（如 Wwise 进程退出/网络断开）置 `false`。
-    /// 与事件循环监控 task 共享。
-    connected: Arc<AtomicBool>,
-}
-
-/// Async cleanup from taken fields: unsubscribe all → leave_realm → disconnect → abort event loop.
-///
-/// Shared by [WaapiClient::cleanup] and `Drop for WaapiClient` to avoid logic duplication.
-///
-/// ---
-///
-/// 从已取出的字段执行异步清理：取消所有订阅 → leave_realm → disconnect → abort 事件循环。
-///
-/// 供 [WaapiClient::cleanup] 与 `Drop for WaapiClient` 共用，避免逻辑重复。
-async fn do_cleanup(
-    client_arc: Option<Arc<TokioMutex<Option<Client<'static>>>>>,
-    subscription_ids: Arc<StdMutex<Vec<WampId>>>,
-    event_loop: Option<tokio::task::JoinHandle<Result<(), WampError>>>,
-    connected: Arc<AtomicBool>,
-) {
-    // Mark disconnected immediately so is_connected() reflects reality at once.
-    // 立即标记为断开，使 is_connected() 第一时间反映真实状态。
-    connected.store(false, Ordering::Release);
-
-    // If the event loop has already finished (e.g. Wwise crashed / network drop),
-    // the underlying WAMP channel is closed and calling unsubscribe/leave_realm/disconnect
-    // would panic inside wamp_async. Skip WAMP-level ops; only clear local state.
-    //
-    // 若事件循环已结束（如 Wwise 崩溃/网络断开），WAMP 底层 channel 已关闭，
-    // 继续调用 unsubscribe/leave_realm/disconnect 会在 wamp_async 内 panic。
-    // 跳过 WAMP 层操作，仅清理本地状态。
-    let wamp_alive = event_loop.as_ref().map(|h| !h.is_finished()).unwrap_or(false);
-
-    if let Some(arc) = client_arc {
-        let ids: Vec<WampId> = {
-            let mut guard = subscription_ids.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::take(&mut *guard)
-        };
-        let mut client_guard = arc.lock().await;
-        if wamp_alive {
-            if let Some(ref mut c) = *client_guard {
-                for sub_id in ids {
-                    let _ = c.unsubscribe(sub_id).await;
-                }
-                let _ = c.leave_realm().await;
-            }
-            if let Some(c) = client_guard.take() {
-                c.disconnect().await;
-            }
-        } else {
-            // Drop the inner Client without WAMP calls; subsequent SubscriptionHandle
-            // drops will see None and skip network unsubscribe safely.
-            //
-            // 直接 drop 内层 Client，不执行 WAMP 调用；
-            // 后续 SubscriptionHandle drop 时看到 None，安全跳过网络退订。
-            client_guard.take();
-        }
-    }
-
-    if let Some(handle) = event_loop {
-        handle.abort();
-    }
-}
-
-impl WaapiClient {
-    /// Connect to WAAPI using the default URL.
-    ///
-    /// Connects to `ws://localhost:8080/waapi` with the default realm.
-    ///
-    /// ---
-    ///
-    /// 使用默认 URL 连接到 WAAPI。
-    ///
-    /// 默认连接到 `ws://localhost:8080/waapi`，使用默认 realm。
-    pub async fn connect() -> Result<Self, WaapiError> {
-        Self::connect_with_url(DEFAULT_WAAPI_URL).await
-    }
-
-    /// Connect to WAAPI at the specified URL.
-    ///
-    /// Joins the default realm after connecting; serialization is JSON, SSL verification disabled.
-    ///
-    /// ---
-    ///
-    /// 使用指定 URL 连接到 WAAPI。
-    ///
-    /// 连接后加入默认 realm；序列化为 JSON，SSL 校验关闭。
-    pub async fn connect_with_url(url: &str) -> Result<Self, WaapiError> {
-        info!("Connecting to WAAPI at {url}");
-        let (mut client, (event_loop, _)) = Client::connect(
-            url,
-            Some(
-                ClientConfig::default()
-                    .set_ssl_verify(false)
-                    .set_serializers(vec![SerializerType::Json]),
-            ),
-        )
-        .await?;
-
-        let connected = Arc::new(AtomicBool::new(true));
-        let connected_flag = Arc::clone(&connected);
-        let handle = tokio::spawn(async move {
-            let result = event_loop.await;
-            // Event loop terminated (normal disconnect or network/Wwise crash).
-            // 事件循环结束（正常断开或网络/Wwise 崩溃），立即更新连接标志。
-            connected_flag.store(false, Ordering::Release);
-            result
-        });
-        client.join_realm(DEFAULT_REALM).await?;
-        info!("Connected to WAAPI at {url}");
-
-        let client = Arc::new(TokioMutex::new(Some(client)));
-        Ok(Self {
-            client: Some(client),
-            event_loop_handle: Some(handle),
-            subscription_ids: Arc::new(StdMutex::new(Vec::new())),
-            connected,
-        })
-    }
-
-    /// Call a WAAPI method.
-    ///
-    /// # Parameters
-    ///
-    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"` or `ak::wwise::core::GET_INFO`
-    /// * `args` - Optional keyword arguments (`serde_json::Value`, e.g. `json!({...})`)
-    /// * `options` - Optional options dict (`serde_json::Value`, may differ from `args`)
-    ///
-    /// Returns `Option<Value>`: WAAPI kwargs deserialized as JSON; `None` when no result.
-    ///
-    /// Note: holds the connection lock for the entire RPC call; only one call executes at a time.
-    ///
-    /// ---
-    ///
-    /// 调用 WAAPI 方法。
-    ///
-    /// # 参数
-    ///
-    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"` 或 `ak::wwise::core::GET_INFO`
-    /// * `args` - 可选的关键字参数（`serde_json::Value`，如 `json!({...})`）
-    /// * `options` - 可选的选项字典（`serde_json::Value`，可与 args 不同）
-    ///
-    /// 返回 `Option<Value>`：WAAPI kwargs 反序列化为 JSON；无结果时为 `None`。
-    ///
-    /// 注意：内部在整个 RPC 调用期间持有连接锁，同一时间只能有一个调用在执行。
-    pub async fn call(
-        &self,
-        uri: &str,
-        args: Option<Value>,
-        options: Option<Value>,
-    ) -> Result<Option<Value>, WaapiError> {
-        let args = args.map(value_to_kwargs).transpose()?;
-        let options = options.map(value_to_wamp_dict).transpose()?;
-        let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
-        debug!("Calling WAAPI: {uri}");
-        let (_, result) = client
-            .lock()
-            .await
-            .as_ref()
-            .ok_or(WaapiError::Disconnected)?
-            .call(uri, None, args, options)
-            .await?;
-        let out = result.map(wamp_result_to_value).transpose()?;
-        Ok(out)
-    }
-
-    /// Internal subscribe: returns handle and receiver. Used by [WaapiClientSync] to bridge events.
-    pub(crate) async fn subscribe_inner(
-        &self,
-        topic: &str,
-        options: Option<Value>,
-    ) -> Result<
-        (
-            SubscriptionHandle,
-            tokio::sync::mpsc::UnboundedReceiver<SubscribeEvent>,
-        ),
-        WaapiError,
-    > {
-        let options = options.map(value_to_wamp_dict).transpose()?;
-        let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
-        let (sub_id, queue) = client
-            .lock()
-            .await
-            .as_ref()
-            .ok_or(WaapiError::Disconnected)?
-            .subscribe(topic, options)
-            .await?;
-        self.subscription_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(sub_id);
-        debug!("Subscribed to {topic} (sub_id={sub_id})");
-        let handle = SubscriptionHandle {
-            sub_id,
-            client: Arc::clone(client),
-            subscription_ids: Arc::clone(&self.subscription_ids),
-            recv_task: None,
-            is_unsubscribed: false,
-        };
-        Ok((handle, queue))
-    }
-
-    /// Subscribe to a topic with a callback: spawns a task to receive events
-    /// and invoke `callback(args, kwargs)`.
-    ///
-    /// The callback runs in a dedicated task and does not block the event loop.
-    /// The returned handle is used to cancel; on drop it aborts the task and auto-unsubscribes.
-    ///
-    /// # Parameters
-    ///
-    /// * `topic` - WAMP topic URI, e.g. `"ak.wwise.ui.selectionChanged"` or `ak::wwise::ui::SELECTION_CHANGED`
-    /// * `options` - Optional subscription options (`serde_json::Value`), e.g. filtering or return fields
-    /// * `callback` - Callback invoked on each event with `(args, kwargs)`
-    ///
-    /// ---
-    ///
-    /// 订阅主题并绑定回调：内部 spawn 一个 task 循环接收事件并调用 `callback(args, kwargs)`。
-    ///
-    /// 回调在独立 task 中执行，不阻塞事件循环。返回的句柄用于取消订阅；drop 时会 abort 该 task 并自动 unsubscribe。
-    ///
-    /// # 参数
-    ///
-    /// * `topic` - WAMP 主题 URI，如 `"ak.wwise.ui.selectionChanged"` 或 `ak::wwise::ui::SELECTION_CHANGED`
-    /// * `options` - 可选的订阅选项（`serde_json::Value`），如过滤、返回字段等
-    /// * `callback` - 每次事件触发时调用的回调，参数为 `(args, kwargs)`
-    pub async fn subscribe<F>(
-        &self,
-        topic: &str,
-        options: Option<Value>,
-        callback: F,
-    ) -> Result<SubscriptionHandle, WaapiError>
-    where
-        F: Fn(Option<wamp_async::WampArgs>, Option<WampKwArgs>) + Send + Sync + 'static,
-    {
-        let options = options.map(value_to_wamp_dict).transpose()?;
-        let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
-        let (sub_id, mut queue) = client
-            .lock()
-            .await
-            .as_ref()
-            .ok_or(WaapiError::Disconnected)?
-            .subscribe(topic, options)
-            .await?;
-        self.subscription_ids
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(sub_id);
-        debug!("Subscribed to {topic} (sub_id={sub_id})");
-        let recv_task = tokio::spawn(async move {
-            while let Some((_, args, kwargs)) = queue.recv().await {
-                callback(args, kwargs);
-            }
-        });
-        let handle = SubscriptionHandle {
-            sub_id,
-            client: Arc::clone(client),
-            subscription_ids: Arc::clone(&self.subscription_ids),
-            recv_task: Some(recv_task),
-            is_unsubscribed: false,
-        };
-        Ok(handle)
-    }
-
-    /// Check whether the client is still connected.
-    ///
-    /// Returns `false` if:
-    /// - [`disconnect`](WaapiClient::disconnect) has been called, or
-    /// - the event loop has terminated (e.g. Wwise process exit or network drop).
-    ///
-    /// Note: updated reactively when the event loop terminates; does not actively probe
-    /// the underlying WebSocket.
-    ///
-    /// ---
-    ///
-    /// 检查客户端是否仍处于连接状态。
-    ///
-    /// 以下情况返回 `false`：
-    /// - 已调用 [`disconnect`](WaapiClient::disconnect)，或
-    /// - 事件循环已终止（如 Wwise 进程退出或网络断开）。
-    ///
-    /// 注意：事件循环终止时被动更新，不主动探测底层 WebSocket 是否存活。
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        self.client.is_some() && self.connected.load(Ordering::Acquire)
-    }
-
-    /// Explicitly disconnect.
-    ///
-    /// Even without calling this, Drop will try to clean up,
-    /// but **explicit call is recommended** for graceful shutdown.
-    ///
-    /// ---
-    ///
-    /// 显式断开连接。
-    ///
-    /// 即使不调用此方法，Drop 时也会尽力清理，但 **推荐显式调用** 以确保优雅关闭。
-    pub async fn disconnect(mut self) {
-        info!("Disconnecting from WAAPI");
-        self.cleanup().await;
-        info!("Disconnected from WAAPI");
-    }
-
-    /// Internal cleanup: delegates to [do_cleanup].
-    ///
-    /// 内部清理：委托给 [do_cleanup]。
-    async fn cleanup(&mut self) {
-        do_cleanup(
-            self.client.take(),
-            Arc::clone(&self.subscription_ids),
-            self.event_loop_handle.take(),
-            Arc::clone(&self.connected),
-        )
-        .await;
     }
 }
 
@@ -478,25 +344,34 @@ impl SubscriptionHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|&id| id != self.sub_id);
+        // Drop the event sender so receivers (e.g. sync bridge thread) see channel closed.
+        self.conn
+            .event_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.sub_id);
         if !mark_unsubscribed(&mut self.is_unsubscribed) {
             return Ok(());
         }
-        if let Some(ref c) = *self.client.lock().await {
-            c.unsubscribe(self.sub_id).await?;
-        }
-        Ok(())
+        do_network_unsubscribe(&self.conn, self.sub_id).await
     }
 }
 
+async fn do_network_unsubscribe(conn: &WampConn, sub_id: u64) -> Result<(), WaapiError> {
+    let id = conn.next_id();
+    let (tx, rx) = oneshot::channel();
+    conn.pending_unsubs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, tx);
+    conn.send(wamp::unsubscribe_msg(id, sub_id)).await?;
+    rx.await.unwrap_or(Err(WaapiError::Disconnected))
+}
+
 impl Drop for SubscriptionHandle {
-    /// Async cleanup via try_current(): spawns an unsubscribe task on the existing runtime,
-    /// avoiding `.await` inside drop. Falls back to local-only cleanup if no runtime is available.
-    ///
-    /// 异步清理：通过 try_current() 在已有 runtime 上 spawn unsubscribe 任务，避免在 drop 中 .await 阻塞；
-    /// 若无当前 runtime 则仅清理本地状态，跳过网络取消（连接已失效）。
     fn drop(&mut self) {
         let sub_id = self.sub_id;
-        let client = Arc::clone(&self.client);
+        let conn = Arc::clone(&self.conn);
         let subscription_ids = Arc::clone(&self.subscription_ids);
         if let Some(task) = self.recv_task.take() {
             task.abort();
@@ -505,15 +380,18 @@ impl Drop for SubscriptionHandle {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|&id| id != sub_id);
+        // Drop the event sender so receivers see channel closed.
+        conn.event_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sub_id);
         if !mark_unsubscribed(&mut self.is_unsubscribed) {
             return;
         }
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             debug!("SubscriptionHandle dropped, spawning unsubscribe for sub_id={sub_id}");
             rt.spawn(async move {
-                if let Some(ref c) = *client.lock().await {
-                    let _ = c.unsubscribe(sub_id).await;
-                }
+                let _ = do_network_unsubscribe(&conn, sub_id).await;
             });
         } else {
             warn!("SubscriptionHandle dropped without runtime, skipping network unsubscribe for sub_id={sub_id}");
@@ -521,22 +399,271 @@ impl Drop for SubscriptionHandle {
     }
 }
 
-impl Drop for WaapiClient {
-    /// Spawns async cleanup if a runtime is available; otherwise only aborts the event loop.
+/// Async WAAPI client.
+///
+/// Provides async access to the Wwise Authoring API (WAAPI);
+/// can be shared across tasks (internal Arc).
+///
+/// **It is recommended to call [`disconnect`](WaapiClient::disconnect) explicitly**
+/// for graceful shutdown.
+///
+/// ---
+///
+/// WAAPI 异步客户端。
+///
+/// **建议显式调用 [`disconnect`](WaapiClient::disconnect)** 以确保优雅关闭。
+pub struct WaapiClient {
+    conn: Option<Arc<WampConn>>,
+    event_loop_handle: Option<tokio::task::JoinHandle<()>>,
+    subscription_ids: Arc<StdMutex<Vec<u64>>>,
+    connected: Arc<AtomicBool>,
+}
+
+impl WaapiClient {
+    /// Connect to WAAPI using the default URL.
     ///
-    /// 若有当前 runtime 则 spawn 异步清理，否则仅 abort 事件循环。
+    /// Connects to `ws://localhost:8080/waapi` with the default realm.
+    ///
+    /// ---
+    ///
+    /// 使用默认 URL 连接到 WAAPI。
+    pub async fn connect() -> Result<Self, WaapiError> {
+        Self::connect_with_url(DEFAULT_WAAPI_URL).await
+    }
+
+    /// Connect to WAAPI at the specified URL.
+    ///
+    /// ---
+    ///
+    /// 使用指定 URL 连接到 WAAPI。
+    pub async fn connect_with_url(url: &str) -> Result<Self, WaapiError> {
+        info!("Connecting to WAAPI at {url}");
+        let (ws_stream, _) = connect_async(url).await.map_err(|e| WaapiError::WebSocket(Box::new(e)))?;
+        let (ws_tx, mut ws_rx) = ws_stream.split();
+
+        let conn = Arc::new(WampConn::new(ws_tx));
+
+        // HELLO handshake
+        conn.send(wamp::hello_msg(DEFAULT_REALM)).await?;
+        let _session_id = read_welcome(&mut ws_rx).await?;
+
+        let connected = Arc::new(AtomicBool::new(true));
+        let connected_flag = Arc::clone(&connected);
+        let conn_for_loop = Arc::clone(&conn);
+        let handle = tokio::spawn(async move {
+            run_event_loop(conn_for_loop, ws_rx, connected_flag).await;
+        });
+
+        info!("Connected to WAAPI at {url}");
+        Ok(Self {
+            conn: Some(conn),
+            event_loop_handle: Some(handle),
+            subscription_ids: Arc::new(StdMutex::new(Vec::new())),
+            connected,
+        })
+    }
+
+    /// Call a WAAPI method.
+    ///
+    /// # Parameters
+    ///
+    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"` or `ak::wwise::core::GET_INFO`
+    /// * `args` - Optional keyword arguments (`serde_json::Value`, e.g. `json!({...})`)
+    /// * `options` - Optional options dict (`serde_json::Value`)
+    ///
+    /// Returns `Option<Value>`: WAAPI response as JSON; `None` when no result.
+    ///
+    /// ---
+    ///
+    /// 调用 WAAPI 方法。
+    ///
+    /// 返回 `Option<Value>`：WAAPI 响应的 JSON 值；无结果时为 `None`。
+    pub async fn call(
+        &self,
+        uri: &str,
+        args: Option<Value>,
+        options: Option<Value>,
+    ) -> Result<Option<Value>, WaapiError> {
+        let conn = self.conn.as_ref().ok_or(WaapiError::Disconnected)?;
+        let id = conn.next_id();
+        let (tx, rx) = oneshot::channel();
+        conn.pending_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        debug!("Calling WAAPI: {uri} (id={id})");
+        conn.send(wamp::call_msg(id, uri, args.as_ref(), options.as_ref()))
+            .await?;
+        rx.await.unwrap_or(Err(WaapiError::Disconnected))
+    }
+
+    /// Internal subscribe: returns handle and receiver. Used by [WaapiClientSync].
+    pub(crate) async fn subscribe_inner(
+        &self,
+        topic: &str,
+        options: Option<Value>,
+    ) -> Result<
+        (
+            SubscriptionHandle,
+            async_mpsc::UnboundedReceiver<EventPayload>,
+        ),
+        WaapiError,
+    > {
+        let conn = self.conn.as_ref().ok_or(WaapiError::Disconnected)?;
+        let id = conn.next_id();
+        let (tx, rx) = oneshot::channel();
+        conn.pending_subs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, tx);
+        conn.send(wamp::subscribe_msg(id, topic, options.as_ref()))
+            .await?;
+        let sub_id = rx.await.unwrap_or(Err(WaapiError::Disconnected))?;
+        debug!("Subscribed to {topic} (sub_id={sub_id})");
+
+        let (event_tx, event_rx) = async_mpsc::unbounded_channel();
+        conn.event_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sub_id, event_tx);
+        self.subscription_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sub_id);
+
+        let handle = SubscriptionHandle {
+            sub_id,
+            conn: Arc::clone(conn),
+            subscription_ids: Arc::clone(&self.subscription_ids),
+            recv_task: None,
+            is_unsubscribed: false,
+        };
+        Ok((handle, event_rx))
+    }
+
+    /// Subscribe to a topic with a callback.
+    ///
+    /// The callback runs in a dedicated task with signature `callback(kwargs)`.
+    /// The returned handle is used to cancel; on drop it auto-unsubscribes.
+    ///
+    /// # Parameters
+    ///
+    /// * `topic` - WAMP topic URI
+    /// * `options` - Optional subscription options (`serde_json::Value`)
+    /// * `callback` - Callback invoked on each event with `kwargs` (`Option<Value>`)
+    ///
+    /// ---
+    ///
+    /// 订阅主题并绑定回调（参数为 `Option<Value>`）。
+    pub async fn subscribe<F>(
+        &self,
+        topic: &str,
+        options: Option<Value>,
+        callback: F,
+    ) -> Result<SubscriptionHandle, WaapiError>
+    where
+        F: Fn(Option<Value>) + Send + Sync + 'static,
+    {
+        let (mut handle, mut event_rx) = self.subscribe_inner(topic, options).await?;
+        let recv_task = tokio::spawn(async move {
+            while let Some((_pub_id, kwargs)) = event_rx.recv().await {
+                callback(kwargs);
+            }
+        });
+        handle.recv_task = Some(recv_task);
+        Ok(handle)
+    }
+
+    /// Check whether the client is still connected.
+    ///
+    /// ---
+    ///
+    /// 检查客户端是否仍处于连接状态。
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.conn.is_some() && self.connected.load(Ordering::Acquire)
+    }
+
+    /// Explicitly disconnect.
+    ///
+    /// **Explicit call is recommended** for graceful shutdown.
+    ///
+    /// ---
+    ///
+    /// 显式断开连接。**推荐显式调用**以确保优雅关闭。
+    pub async fn disconnect(mut self) {
+        info!("Disconnecting from WAAPI");
+        self.cleanup().await;
+        info!("Disconnected from WAAPI");
+    }
+
+    async fn cleanup(&mut self) {
+        self.connected.store(false, Ordering::Release);
+        if let Some(conn) = self.conn.take() {
+            // Unsubscribe all active subscriptions
+            let ids: Vec<u64> = {
+                let mut guard = self.subscription_ids.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::take(&mut *guard)
+            };
+            for sub_id in ids {
+                let id = conn.next_id();
+                let (tx, rx) = oneshot::channel();
+                conn.pending_unsubs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, tx);
+                if conn.send(wamp::unsubscribe_msg(id, sub_id)).await.is_ok() {
+                    let _ = rx.await;
+                }
+            }
+            // GOODBYE
+            let _ = conn.send(wamp::goodbye_msg()).await;
+            // Close WebSocket
+            let _ = conn.ws_tx.lock().await.close().await;
+        }
+        if let Some(handle) = self.event_loop_handle.take() {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for WaapiClient {
     fn drop(&mut self) {
-        if self.client.is_some() || self.event_loop_handle.is_some() {
-            let client_arc = self.client.take();
+        if self.conn.is_some() || self.event_loop_handle.is_some() {
+            let conn = self.conn.take();
             let event_loop = self.event_loop_handle.take();
             let subscription_ids = Arc::clone(&self.subscription_ids);
             let connected = Arc::clone(&self.connected);
+            connected.store(false, Ordering::Release);
             if let Ok(rt) = tokio::runtime::Handle::try_current() {
                 debug!("WaapiClient dropped, spawning async cleanup");
-                rt.spawn(do_cleanup(client_arc, subscription_ids, event_loop, connected));
+                rt.spawn(async move {
+                    if let Some(conn) = conn {
+                        let ids: Vec<u64> = {
+                            let mut guard =
+                                subscription_ids.lock().unwrap_or_else(|e| e.into_inner());
+                            std::mem::take(&mut *guard)
+                        };
+                        for sub_id in ids {
+                            let id = conn.next_id();
+                            let (tx, rx) = oneshot::channel::<UnsubResult>();
+                            conn.pending_unsubs
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .insert(id, tx);
+                            if conn.send(wamp::unsubscribe_msg(id, sub_id)).await.is_ok() {
+                                let _ = rx.await;
+                            }
+                        }
+                        let _ = conn.send(wamp::goodbye_msg()).await;
+                        let _ = conn.ws_tx.lock().await.close().await;
+                    }
+                    if let Some(h) = event_loop {
+                        h.abort();
+                    }
+                });
             } else {
                 warn!("WaapiClient dropped without runtime, skipping graceful cleanup");
-                connected.store(false, Ordering::Release);
                 if let Some(h) = event_loop {
                     h.abort();
                 }
@@ -545,6 +672,8 @@ impl Drop for WaapiClient {
     }
 }
 
+// ── Sync client ───────────────────────────────────────────────────
+
 /// Sync subscription handle: cancels subscriptions created by [WaapiClientSync::subscribe].
 ///
 /// Calls [SubscriptionHandleSync::unsubscribe] or drop to cancel and wait for the bridge thread.
@@ -552,10 +681,7 @@ impl Drop for WaapiClient {
 ///
 /// ---
 ///
-/// 同步订阅句柄：用于取消通过 [WaapiClientSync::subscribe] 创建的订阅。
-///
-/// 调用 [SubscriptionHandleSync::unsubscribe] 或 drop 时取消订阅并等待桥接线程结束。
-/// **注意：不要在回调内部 drop 本句柄，否则可能死锁。**
+/// 同步订阅句柄。**注意：不要在回调内部 drop 本句柄，否则可能死锁。**
 pub struct SubscriptionHandleSync {
     runtime: Arc<tokio::runtime::Runtime>,
     inner: Option<SubscriptionHandle>,
@@ -583,11 +709,6 @@ impl SubscriptionHandleSync {
 }
 
 impl Drop for SubscriptionHandleSync {
-    /// When not on the bridge thread: block_on unsubscribe and join the bridge thread.
-    /// Inside the bridge thread or async context: falls back to spawn to avoid deadlock/panic.
-    ///
-    /// 不在桥接线程时：block_on 执行 unsubscribe 并 join 桥接线程；
-    /// 在桥接线程或 async 上下文中则降级为 spawn，避免死锁/panic。
     fn drop(&mut self) {
         let is_bridge_thread = self.bridge_thread_id.as_ref() == Some(&thread::current().id());
         let inner = self.inner.take();
@@ -614,20 +735,13 @@ impl Drop for SubscriptionHandleSync {
 /// Sync WAAPI client.
 ///
 /// Provides sync access to the Wwise Authoring API (WAAPI); internally uses a multi-threaded
-/// tokio runtime and wraps [WaapiClient] via `block_on`. Suitable for scripts and non-async code;
-/// if already in an async context, prefer [WaapiClient] directly.
+/// tokio runtime and wraps [WaapiClient] via `block_on`.
 ///
-/// The client auto-cleans on Drop, but **explicit [`disconnect`](WaapiClientSync::disconnect)
-/// is recommended** for graceful shutdown.
+/// **Explicit [`disconnect`](WaapiClientSync::disconnect) is recommended** for graceful shutdown.
 ///
 /// ---
 ///
-/// WAAPI 同步客户端。
-///
-/// 提供同步接口访问 Wwise Authoring API (WAAPI)；内部使用多线程 tokio runtime，通过 `block_on` 封装 [WaapiClient]。
-/// 适用于脚本、非 async 代码；若已在 async 环境中，建议直接使用 [WaapiClient]。
-///
-/// 客户端在 Drop 时会自动清理资源，但 **推荐显式调用 [`disconnect`](WaapiClientSync::disconnect)** 以确保优雅关闭。
+/// WAAPI 同步客户端。**推荐显式调用 [`disconnect`](WaapiClientSync::disconnect)**。
 pub struct WaapiClientSync {
     runtime: Arc<tokio::runtime::Runtime>,
     client: Option<WaapiClient>,
@@ -636,27 +750,18 @@ pub struct WaapiClientSync {
 impl WaapiClientSync {
     /// Connect to WAAPI using the default URL.
     ///
-    /// Connects to `ws://localhost:8080/waapi` with the default realm.
-    ///
     /// ---
     ///
     /// 使用默认 URL 连接到 WAAPI。
-    ///
-    /// 默认连接到 `ws://localhost:8080/waapi`，使用默认 realm。
     pub fn connect() -> Result<Self, WaapiError> {
         Self::connect_with_url(DEFAULT_WAAPI_URL)
     }
 
     /// Connect to WAAPI at the specified URL.
     ///
-    /// Joins the default realm after connecting; internally uses `block_on` to call
-    /// the async client. Serialization and SSL behavior match the async variant.
-    ///
     /// ---
     ///
     /// 使用指定 URL 连接到 WAAPI。
-    ///
-    /// 连接后加入默认 realm；内部通过 block_on 调用异步客户端，序列化与 SSL 行为与异步版一致。
     pub fn connect_with_url(url: &str) -> Result<Self, WaapiError> {
         info!("Connecting to WAAPI (sync) at {url}");
         let runtime = Arc::new(
@@ -666,7 +771,6 @@ impl WaapiClientSync {
         );
         let client = runtime.block_on(WaapiClient::connect_with_url(url))?;
         info!("Connected to WAAPI (sync) at {url}");
-
         Ok(Self {
             runtime,
             client: Some(client),
@@ -675,25 +779,9 @@ impl WaapiClientSync {
 
     /// Call a WAAPI method.
     ///
-    /// # Parameters
-    ///
-    /// * `uri` - URI of the WAAPI method, e.g. `"ak.wwise.core.getInfo"` or `ak::wwise::core::GET_INFO`
-    /// * `args` - Optional keyword arguments (`serde_json::Value`)
-    /// * `options` - Optional options dict (`serde_json::Value`, may differ from `args`)
-    ///
-    /// Returns `Option<Value>`: WAAPI kwargs deserialized as JSON; `None` when no result.
-    ///
     /// ---
     ///
     /// 调用 WAAPI 方法。
-    ///
-    /// # 参数
-    ///
-    /// * `uri` - WAAPI 方法的 URI，如 `"ak.wwise.core.getInfo"` 或 `ak::wwise::core::GET_INFO`
-    /// * `args` - 可选的关键字参数（`serde_json::Value`）
-    /// * `options` - 可选的选项字典（`serde_json::Value`，可与 args 不同）
-    ///
-    /// 返回 `Option<Value>`：WAAPI kwargs 反序列化为 JSON；无结果时为 `None`。
     pub fn call(
         &self,
         uri: &str,
@@ -704,29 +792,15 @@ impl WaapiClientSync {
         self.runtime.block_on(client.call(uri, args, options))
     }
 
-    /// Subscribe to a topic with a callback: receives events in a dedicated thread
-    /// and synchronously calls `callback(args, kwargs)`.
+    /// Subscribe to a topic with a callback.
     ///
     /// To unsubscribe: call [SubscriptionHandleSync::unsubscribe] or drop the handle.
     /// Do not drop the handle inside the callback.
     ///
-    /// # Parameters
-    ///
-    /// * `topic` - WAMP topic URI, e.g. `"ak.wwise.ui.selectionChanged"` or `ak::wwise::ui::SELECTION_CHANGED`
-    /// * `options` - Optional subscription options (`serde_json::Value`), e.g. filtering or return fields
-    /// * `callback` - Callback invoked on each event with `(args, kwargs)`
-    ///
     /// ---
     ///
-    /// 订阅主题并绑定回调：在独立线程中接收事件并同步调用 `callback(args, kwargs)`。
-    ///
-    /// 取消订阅：调用返回的 [SubscriptionHandleSync::unsubscribe]，或 drop 句柄。不要在 callback 内 drop 句柄。
-    ///
-    /// # 参数
-    ///
-    /// * `topic` - WAMP 主题 URI，如 `"ak.wwise.ui.selectionChanged"` 或 `ak::wwise::ui::SELECTION_CHANGED`
-    /// * `options` - 可选的订阅选项（`serde_json::Value`），如过滤、返回字段等
-    /// * `callback` - 每次事件触发时调用的回调，参数为 `(args, kwargs)`
+    /// 订阅主题并绑定回调。取消订阅：调用返回的 [SubscriptionHandleSync::unsubscribe]，或 drop 句柄。
+    /// 不要在 callback 内 drop 句柄。
     pub fn subscribe<F>(
         &self,
         topic: &str,
@@ -734,12 +808,9 @@ impl WaapiClientSync {
         callback: F,
     ) -> Result<SubscriptionHandleSync, WaapiError>
     where
-        F: Fn(Option<wamp_async::WampArgs>, Option<WampKwArgs>) + Send + Sync + 'static,
+        F: Fn(Option<Value>) + Send + Sync + 'static,
     {
-        let client = self
-            .client
-            .as_ref()
-            .ok_or(WaapiError::Disconnected)?;
+        let client = self.client.as_ref().ok_or(WaapiError::Disconnected)?;
         let (inner, mut async_rx) = self
             .runtime
             .block_on(client.subscribe_inner(topic, options))?;
@@ -747,30 +818,24 @@ impl WaapiClientSync {
         let runtime = Arc::clone(&self.runtime);
         let bridge_join = thread::spawn(move || {
             let _ = id_tx.send(thread::current().id());
-            while let Some((_, args, kwargs)) = runtime.block_on(async_rx.recv()) {
-                callback(args, kwargs);
+            while let Some((_pub_id, kwargs)) = runtime.block_on(async_rx.recv()) {
+                callback(kwargs);
             }
         });
         let bridge_thread_id = id_rx.recv().ok();
-        let handle = SubscriptionHandleSync {
+        Ok(SubscriptionHandleSync {
             runtime: Arc::clone(&self.runtime),
             inner: Some(inner),
             bridge_join: Some(bridge_join),
             bridge_thread_id,
-        };
-        Ok(handle)
+        })
     }
 
     /// Check whether the client is still logically connected.
     ///
-    /// Note: reflects local state only (whether `disconnect` has been called);
-    /// does not probe the underlying WebSocket.
-    ///
     /// ---
     ///
     /// 检查客户端是否仍处于逻辑连接状态。
-    ///
-    /// 注意：仅反映本地状态（是否调用过 `disconnect`），不检测底层 WebSocket 是否存活。
     #[must_use]
     pub fn is_connected(&self) -> bool {
         self.client.as_ref().is_some_and(|c| c.is_connected())
@@ -778,14 +843,9 @@ impl WaapiClientSync {
 
     /// Explicitly disconnect.
     ///
-    /// Even without calling this, Drop will auto-disconnect,
-    /// but **explicit call is recommended** for graceful shutdown.
-    ///
     /// ---
     ///
     /// 显式断开连接。
-    ///
-    /// 即使不调用此方法，Drop 时也会自动断开，但 **推荐显式调用** 以确保优雅关闭。
     pub fn disconnect(mut self) {
         info!("Disconnecting from WAAPI (sync)");
         if let Some(client) = self.client.take() {
@@ -796,13 +856,6 @@ impl WaapiClientSync {
 }
 
 impl Drop for WaapiClientSync {
-    /// Disconnects on drop. If inside an async context, offloads cleanup to a dedicated thread
-    /// to avoid runtime lifetime issues.
-    /// Note: the spawned thread's JoinHandle is not joined; cleanup may not complete
-    /// if the process is exiting. Prefer calling `disconnect` explicitly.
-    ///
-    /// Drop 时断开连接；若在 async 上下文中则将清理转移到独立线程执行，避免 runtime 生命周期导致清理任务丢失。
-    /// 注意：该线程的 JoinHandle 未被 join，若进程正在退出，清理可能无法完成；建议显式调用 `disconnect`。
     fn drop(&mut self) {
         if let Some(client) = self.client.take() {
             if tokio::runtime::Handle::try_current().is_ok() {
@@ -819,6 +872,8 @@ impl Drop for WaapiClientSync {
         }
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -840,7 +895,7 @@ mod tests {
                 .expect("failed to create runtime"),
         );
         let async_client = WaapiClient {
-            client: None,
+            conn: None,
             event_loop_handle: None,
             subscription_ids: Arc::new(StdMutex::new(Vec::new())),
             connected: Arc::new(AtomicBool::new(false)),
@@ -849,7 +904,6 @@ mod tests {
             runtime,
             client: Some(async_client),
         };
-
         drop(sync_client);
     }
 }
