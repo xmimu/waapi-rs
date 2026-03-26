@@ -23,7 +23,7 @@ Wwise Authoring API (WAAPI) 的 Rust 客户端，基于 WAMP over WebSocket，�
 
 ```toml
 [dependencies]
-waapi-rs = { git = "https://github.com/xmimu/waapi-rs.git", branch = "dev" }
+waapi-rs = { git = "https://github.com/xmimu/waapi-rs.git" }
 tokio = { version = "1", features = ["full"] }
 ```
 
