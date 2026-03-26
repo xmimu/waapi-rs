@@ -2,15 +2,7 @@
 
 ## P0 — 发布阻塞项
 
-- [ ] **解决 `wamp_async` git 依赖（方案 B：以新名字发布 fork）**
-  crates.io 不允许 git 依赖。采用方案 B —— 将 fork 以新 crate 名发布到 crates.io，解除发布阻塞。
-  1. [ ] 精简 fork：在 `xmimu/wamp_async` 的 dev 分支上，去掉 `waapi_client.rs`、WAAPI examples、`WAAPI_CLIENT_GUIDE.md` 等与核心改动无关的文件
-  2. [ ] 修改 fork 的 `Cargo.toml`：`name = "wamp-async-waapi"`，添加 `license`、`description`、`repository` 等元数据，确保 `rmp-serde` 版本兼容
-  3. [ ] 发布 fork 到 crates.io：`cargo publish`
-  4. [ ] 修改 waapi-rs 的 `Cargo.toml`：`wamp_async` 改为 `wamp-async-waapi = "0.3.2"`（或对应版本）
-  5. [ ] 更新 waapi-rs 代码中的 `use wamp_async::` 路径为 `use wamp_async_waapi::`（取决于 crate 名与 lib name 的映射）
-  
-  > 建议：可同时向上游提交 PR（方案 A），PR 合并后再切回官方版本
+- [x] **解决 `wamp_async` git 依赖** — 已完成重构，改用 `tokio-tungstenite` 自行实现 WAMP Basic Profile 子集，彻底去除所有 git 依赖，所有依赖均为 crates.io 版本。
 
 - [x] **添加 `license` 字段** — 已添加 `license = "MIT"`
 
@@ -24,31 +16,24 @@
 
 ## P1 — 强烈建议
 
-- [ ] **补充 `Cargo.toml` 中的 `authors` 格式**
-  当前为 `"xmimu 1101588023@qq.com"`，标准格式应为 `"xmimu <1101588023@qq.com>"`
+- [x] **补充 `Cargo.toml` 中的 `authors` 格式** — 已修正为标准格式 `"xmimu <1101588023@qq.com>"`
 
-- [ ] **README 安装说明更新**
-  发布后需将安装方式从 git 依赖改为 crates.io 版本号依赖，如：
-  ```toml
-  [dependencies]
-  waapi-rs = "0.1.0"
-  ```
+- [x] **README 安装说明更新** — 已更新为 `waapi-rs = "0.2"`（crates.io 版本号依赖）
 
-- [ ] **确认公开 API 的文档注释完整**
-  运行 `cargo doc --no-deps` 检查生成文档，确保所有 pub 类型和方法都有文档
+- [x] **确认公开 API 的文档注释完整** — `cargo doc --no-deps` 无警告，文档生成正常
 
-- [ ] **运行 `cargo clippy` 修复所有 lint 警告**
+- [x] **运行 `cargo clippy` 修复所有 lint 警告** — 修复 `uninlined_format_args` 及 5 处 `result_large_err`（`WebSocket` variant 改为 `Box<tungstenite::Error>`），0 警告
 
-- [ ] **运行 `cargo test` 确保测试通过**
+- [x] **运行 `cargo test` 确保测试通过** — 全部通过（集成测试 + doctest）
 
 - [ ] **运行 `cargo publish --dry-run` 模拟发布，确认无报错**
 
 ## P2 — 最佳实践
 
-- [ ] **添加 CHANGELOG.md** — 记录版本变更历史
+- [x] **添加 CHANGELOG.md** — 已创建，记录 v0.1.0 和 v0.2.0 变更历史
 
-- [ ] **添加 CI（GitHub Actions）** — 自动运行 clippy / test / doc
+- [x] **添加 CI（GitHub Actions）** — 已添加 `.github/workflows/ci.yml`，自动运行 test / clippy / doc 三个 job
 
-- [ ] **检查 `cargo package --list`** — 确认打包内容正确，无多余文件
+- [x] **检查 `cargo package --list`** — 内容正确；`docs/TODO.md` 和 `.github/` 已通过 `exclude` 排除
 
-- [ ] **考虑添加 `exclude` 字段** — 排除 `docs/`、`examples/` 等非必要目录（如果不想包含在发布包中）
+- [x] **考虑添加 `exclude` 字段** — 已在 `Cargo.toml` 添加 `exclude = ["docs/TODO.md", ".github/"]`

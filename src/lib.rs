@@ -88,7 +88,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let client = WaapiClient::connect().await?;
 //!     let handle = client
-//!         .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |_args, kwargs| {
+//!         .subscribe(ak::wwise::ui::SELECTION_CHANGED, None, |kwargs| {
 //!             println!("Selection changed: {:?}", kwargs);
 //!         })
 //!         .await?;
@@ -128,9 +128,9 @@
 //! `call` 返回 `Option<serde_json::Value>`：WAAPI 响应的 JSON 值。
 //! `args` / `options` 为 `Option<serde_json::Value>`（如 `Some(json!({...}))` 或 `None`）。
 
-mod args;
 mod client;
 mod uris;
+mod wamp;
 pub use uris::ak;
 
 pub use client::{

@@ -16,8 +16,8 @@
 
 ### Dependencies and Protocol
 
-- **Core dependency**: `wamp_async` ([xmimu/wamp_async](https://github.com/xmimu/wamp_async), branch: dev), handling WebSocket connections and the WAMP protocol.
-- **Communication**: WebSocket + WAMP, serialized as JSON; default URL `ws://localhost:8080/waapi`, default realm `realm1`.
+- **WebSocket**: `tokio-tungstenite` for async WebSocket connections; WAMP Basic Profile implemented internally in `src/wamp.rs`.
+- **Communication**: WebSocket + WAMP, JSON serialization only; default URL `ws://localhost:8080/waapi`, default realm `realm1`.
 - **Runtime**: `tokio` for async IO and task scheduling; the sync client internally uses a multi-threaded runtime.
 
 ### Architecture Overview
@@ -27,25 +27,27 @@ flowchart LR
     App[Application]
     Async[WaapiClient]
     Sync[WaapiClientSync]
-    Wamp[wamp_async Client]
-    WS[WebSocket]
+    Conn[WampConn]
+    Loop[event loop task]
+    WS[tokio-tungstenite]
     App --> Async
     App --> Sync
     Sync --> Async
-    Async --> Wamp
-    Wamp --> WS
+    Async --> Conn
+    Conn --> Loop
+    Conn --> WS
 ```
 
 - Applications use `WaapiClient` (async) or `WaapiClientSync` (sync).
 - `WaapiClientSync` internally holds a `tokio::runtime::Runtime` and a `WaapiClient`, converting async calls to blocking via `block_on`.
-- `WaapiClient` holds a `wamp_async::Client` and a `JoinHandle` for the event loop; the event loop is spawned via `tokio::spawn` on `connect` and aborted on `cleanup` or `Drop`.
+- `WaapiClient` holds an `Arc<WampConn>` and a `JoinHandle` for the event loop task. `WampConn` owns the WebSocket sink and `HashMap`s for pending RPC / subscription responses, keyed by request ID. The event loop task reads from the WebSocket stream and routes each message to the appropriate `oneshot` or `mpsc` channel.
 
 ### Core Type Responsibilities
 
 | Type | Responsibility |
 |------|---------------|
-| **WaapiClient** | Async connect (`connect` / `connect_with_url`), RPC (`call`), subscriptions (`subscribe(topic, options, callback)`), lifecycle management (`disconnect`, `cleanup`); shareable across tasks (internal `Arc` + `Mutex`). |
-| **WaapiClientSync** | Creates and holds a multi-threaded runtime; exposes sync `connect` / `connect_with_url`, `call`, `subscribe(topic, options, callback)`, `is_connected`, `disconnect`; for non-async environments. |
+| **WaapiClient** | Async connect (`connect` / `connect_with_url`), RPC (`call`), subscriptions (`subscribe(topic, options, \|kwargs\| {...})`), lifecycle management (`disconnect`, `cleanup`); shareable across tasks (internal `Arc`). |
+| **WaapiClientSync** | Creates and holds a multi-threaded runtime; exposes sync `connect` / `connect_with_url`, `call`, `subscribe(topic, options, \|kwargs\| {...})`, `is_connected`, `disconnect`; for non-async environments. |
 | **SubscriptionHandle** | Holds subscription ID, shared `Arc` with client, and `recv_task` for the callback loop; `unsubscribe()` cancels explicitly, `Drop` spawns async cancel in background to avoid blocking. |
 | **SubscriptionHandleSync** | Cancels subscriptions created by the sync client; `unsubscribe()` or drop cancels and joins the bridge thread. **Do not drop inside a callback — may deadlock.** |
 
@@ -56,17 +58,17 @@ flowchart LR
 
 ### Subscription Model
 
-- **`subscribe(topic, options, callback)`**: internally spawns a task that receives events and invokes `callback(args, kwargs)`; the callback runs in a dedicated task without blocking the event loop. Returns `SubscriptionHandle`. On cancel, `SubscriptionHandle` aborts the task and unsubscribes. Dropping `SubscriptionHandle` removes from the client's `subscription_ids` and runs `unsubscribe` in the background, avoiding `.await` inside `Drop`.
-- **Sync client**: `WaapiClientSync::subscribe(topic, options, callback)` returns `SubscriptionHandleSync`. Cancel by calling `unsubscribe()` or dropping the handle. **Do not drop `SubscriptionHandleSync` inside a callback — may deadlock.**
+- **`subscribe(topic, options, callback)`**: internally registers an `mpsc::UnboundedSender` in `WampConn::event_senders` keyed by subscription ID; spawns a task that receives `EventPayload` and invokes `callback(kwargs: Option<Value>)`. Returns `SubscriptionHandle`. On cancel, `SubscriptionHandle` aborts the task, removes the sender from `event_senders` (closing the channel), and sends `UNSUBSCRIBE` to the server. Dropping `SubscriptionHandle` follows the same path in the background.
+- **Sync client**: `WaapiClientSync::subscribe(topic, options, callback)` returns `SubscriptionHandleSync`. A bridge thread blocks on `event_rx.recv()` and calls `callback(kwargs)`. Cancel by calling `unsubscribe()` or dropping the handle. **Do not drop `SubscriptionHandleSync` inside a callback — may deadlock.**
 
 ### Resource and Lifecycle
 
-- **Disconnect order**: unsubscribe all registered subscriptions → `leave_realm` → `disconnect`; finally abort the event loop task. Both `cleanup()` and `Drop` follow this order.
+- **Disconnect order**: unsubscribe all registered subscriptions (await `UNSUBSCRIBED` for each) → send `GOODBYE` → close WebSocket; finally abort the event loop task. Both `cleanup()` and `Drop` follow this order.
 - **Drop behavior**: `WaapiClient` and `SubscriptionHandle` use `tokio::runtime::Handle::try_current()` to `spawn` async cleanup on an existing runtime when possible, avoiding blocking inside drop. If no runtime is available, only the event loop handle is aborted.
 
 ### Errors and Boundaries
 
-- **Error type**: public APIs use `Result<T, WaapiError>`; `WaapiError` aggregates WAMP protocol (`WampError`), serialization (`serde_json::Error`), IO (`std::io::Error`), and client-disconnected (`Disconnected`) errors via `thiserror`.
+- **Error type**: public APIs use `Result<T, WaapiError>`; `WaapiError` aggregates WebSocket (`tokio_tungstenite::tungstenite::Error`), WAMP-level errors (server-returned `ERROR` message, as `Wamp(String)`), serialization (`serde_json::Error`), IO (`std::io::Error`), and client-disconnected (`Disconnected`) via `thiserror`.
 - **"Client already disconnected"**: returned when `client` or `client.lock().await` is `None` (e.g. after `disconnect` or `cleanup` has been called).
 - **Tests**: some tests depend on a local WAAPI (Wwise running with Authoring API enabled); on connection failure they `eprintln` an explanation and return without panicking, implementing a "WAAPI-optional CI-friendly" skip strategy.
 
@@ -76,7 +78,7 @@ flowchart LR
 |------------------------------|----------|
 | `WaapiClient()` / `connect()` | `WaapiClient::connect().await` or `WaapiClientSync::connect()` |
 | `client.call(uri, options=...)` | `client.call(uri, args, options)`; returns `Result<Option<Value>, Error>`; URI via constants like `ak::wwise::core::GET_INFO` |
-| `client.subscribe(topic, callback)` | `subscribe(topic, options, \|args, kwargs\| { ... })`; topic via `ak::wwise::ui::SELECTION_CHANGED` etc. |
+| `client.subscribe(topic, callback)` | `subscribe(topic, options, \|kwargs\| { ... })`; topic via `ak::wwise::ui::SELECTION_CHANGED` etc. |
 | `handler.unsubscribe()` | `handle.unsubscribe().await` or drop `SubscriptionHandle` |
 | `client.disconnect()` | `client.disconnect().await` or drop `WaapiClient` |
 
@@ -102,8 +104,8 @@ Useful for migration from Python.
 
 ### 依赖与协议
 
-- **核心依赖**：`wamp_async`（[xmimu/wamp_async](https://github.com/xmimu/wamp_async)，branch: dev），负责 WebSocket 连接与 WAMP 协议。
-- **通信方式**：WebSocket + WAMP，序列化使用 JSON；默认 URL `ws://localhost:8080/waapi`，默认 realm `realm1`。
+- **WebSocket**：`tokio-tungstenite` 提供异步 WebSocket 连接；WAMP Basic Profile 在 `src/wamp.rs` 中自行实现。
+- **通信方式**：WebSocket + WAMP，仅使用 JSON 序列化；默认 URL `ws://localhost:8080/waapi`，默认 realm `realm1`。
 - **运行时**：`tokio`，用于异步 IO 与任务调度；同步客户端内部使用多线程 runtime。
 
 ### 架构概览
@@ -113,24 +115,26 @@ flowchart LR
     App[应用代码]
     Async[WaapiClient]
     Sync[WaapiClientSync]
-    Wamp[wamp_async Client]
-    WS[WebSocket]
+    Conn[WampConn]
+    Loop[事件循环 task]
+    WS[tokio-tungstenite]
     App --> Async
     App --> Sync
     Sync --> Async
-    Async --> Wamp
-    Wamp --> WS
+    Async --> Conn
+    Conn --> Loop
+    Conn --> WS
 ```
 
 - 应用层使用 `WaapiClient`（异步）或 `WaapiClientSync`（同步）。
 - `WaapiClientSync` 内部持有一个 `tokio::runtime::Runtime` 和 `WaapiClient`，通过 `block_on` 将异步调用转为阻塞。
-- `WaapiClient` 持有 `wamp_async::Client` 和事件循环的 `JoinHandle`；事件循环在 `connect` 时由 `tokio::spawn` 启动，在 `cleanup` 或 `Drop` 时被 abort。
+- `WaapiClient` 持有 `Arc<WampConn>` 和事件循环 task 的 `JoinHandle`。`WampConn` 持有 WebSocket sink 以及按请求 ID 索引的 pending RPC / 订阅响应 `HashMap`。事件循环 task 从 WebSocket stream 读取消息，将每条消息路由到对应的 `oneshot` 或 `mpsc` channel。
 
 ### 核心类型职责
 
 | 类型 | 职责 |
 |------|------|
-| **WaapiClient** | 异步连接（`connect` / `connect_with_url`）、RPC（`call`）、订阅（`subscribe(topic, options, callback)`）、生命周期管理（`disconnect`、`cleanup`）；可在多任务间共享（内部用 `Arc` + `Mutex`）。 |
+| **WaapiClient** | 异步连接（`connect` / `connect_with_url`）、RPC（`call`）、订阅（`subscribe(topic, options, \|kwargs\| {...})`）、生命周期管理（`disconnect`、`cleanup`）；可在多任务间共享（内部用 `Arc`）。 |
 | **WaapiClientSync** | 内部创建并持有多线程 runtime，对外提供同步的 `connect` / `connect_with_url`、`call`、`subscribe(topic, options, callback)`、`is_connected`、`disconnect`；适用于非 async 环境。 |
 | **SubscriptionHandle** | 持有订阅 ID、与 client 共享的 `Arc`、以及回调循环的 `recv_task`；`unsubscribe()` 显式取消，`Drop` 时也会在后台 spawn 异步取消，避免阻塞。 |
 | **SubscriptionHandleSync** | 用于取消同步客户端创建的订阅；`unsubscribe()` 或 drop 时取消订阅并 join 桥接线程；**禁止在回调内部 drop，否则可能死锁。** |
