@@ -26,7 +26,7 @@
 
 - [x] **运行 `cargo test` 确保测试通过** — 全部通过（集成测试 + doctest）
 
-- [ ] **运行 `cargo publish --dry-run` 模拟发布，确认无报错**
+- [x] **运行 `cargo publish --dry-run` 模拟发布，确认无报错**
 
 ## P2 — 最佳实践
 
