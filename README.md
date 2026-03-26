@@ -6,8 +6,8 @@ A Rust client for the Wwise Authoring API (WAAPI), based on WAMP over WebSocket,
 
 ### Features
 
-- **Async client** [`WaapiClient`](https://docs.rs/waapi-rs/): async connect, RPC calls, topic subscriptions; shareable across tasks
-- **Sync client** [`WaapiClientSync`](https://docs.rs/waapi-rs/): internally manages a tokio runtime, blocking calls; ideal for scripts or non-async code
+- **Async client** [`WaapiClient`](https://docs.rs/waapi-rs/0.2.0/waapi_rs/struct.WaapiClient.html): async connect, RPC calls, topic subscriptions; shareable across tasks
+- **Sync client** [`WaapiClientSync`](https://docs.rs/waapi-rs/0.2.0/waapi_rs/struct.WaapiClientSync.html): internally manages a tokio runtime, blocking calls; ideal for scripts or non-async code
 - **RPC calls**: `call(uri, args, options)` to invoke WAAPI methods, returning `Result<Option<Value>, Error>` where `Value` is `serde_json::Value`
 - **URI constants**: `waapi_rs::ak` provides nested modules and constants matching WAAPI URI paths (e.g. `ak::wwise::core::GET_INFO`, `ak::wwise::waapi::GET_TOPICS`), avoiding hand-written strings
 - **Topic subscriptions**: `subscribe(topic, options, callback)` binds a callback `|kwargs: Option<Value>|` for receiving events; cancel via `SubscriptionHandle` / `SubscriptionHandleSync`; auto-cleaned on drop
@@ -76,9 +76,10 @@ Examples: `client.call(ak::wwise::core::GET_INFO, None, None)`, `client.call(ak:
 - Subscribe to selection changes (callback): `cargo run --example subscribe`
 - Run tests: `cargo test` (some tests require a local WAAPI, otherwise they skip)
 
-### Docs and Design
+### Documentation
 
-- Generate and open API docs: `cargo doc --open`
+- [API Docs (docs.rs)](https://docs.rs/waapi-rs/0.2.0)
+- Generate and open local API docs: `cargo doc --open`
 - Development design and architecture: [DESIGN.md](docs/DESIGN.md)
 
 ### References
