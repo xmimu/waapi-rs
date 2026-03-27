@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 // WAMP 消息类型编号
 const WELCOME: u64 = 2;
-const GOODBYE: u64 = 3;
+const GOODBYE: u64 = 6;
 const ERROR: u64 = 8;
 const RESULT: u64 = 50;
 const SUBSCRIBED: u64 = 33;
@@ -131,7 +131,7 @@ pub fn unsubscribe_msg(id: u64, sub_id: u64) -> String {
     json!([34, id, sub_id]).to_string()
 }
 
-/// `[3, {}, "wamp.close.normal"]`
+/// `[6, {}, "wamp.close.normal"]`
 pub fn goodbye_msg() -> String {
-    json!([3, {}, "wamp.close.normal"]).to_string()
+    json!([6, {}, "wamp.close.normal"]).to_string()
 }
