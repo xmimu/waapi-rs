@@ -78,7 +78,7 @@ Examples: `client.call(ak::wwise::core::GET_INFO, None, None)`, `client.call(ak:
 
 ### Documentation
 
-- [API Docs (docs.rs)](https://docs.rs/waapi-rs/0.2.0)
+- [API Docs (docs.rs)](https://docs.rs/waapi-rs)
 - Generate and open local API docs: `cargo doc --open`
 - Development design and architecture: [DESIGN.md](docs/DESIGN.md)
 
