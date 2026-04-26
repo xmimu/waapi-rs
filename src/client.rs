@@ -96,6 +96,7 @@ type WsSink = futures_util::stream::SplitSink<
     Message,
 >;
 
+#[derive(Debug)]
 struct WampConn {
     ws_tx: TokioMutex<WsSink>,
     pending_calls: StdMutex<HashMap<u64, oneshot::Sender<CallResult>>>,
@@ -312,6 +313,7 @@ async fn read_welcome(
 /// ---
 ///
 /// 订阅句柄：用于取消订阅；drop 时会自动在后台执行 unsubscribe。
+#[derive(Debug)]
 pub struct SubscriptionHandle {
     sub_id: u64,
     conn: Arc<WampConn>,
@@ -412,6 +414,7 @@ impl Drop for SubscriptionHandle {
 /// WAAPI 异步客户端。
 ///
 /// **建议显式调用 [`disconnect`](WaapiClient::disconnect)** 以确保优雅关闭。
+#[derive(Debug)]
 pub struct WaapiClient {
     conn: Option<Arc<WampConn>>,
     event_loop_handle: Option<tokio::task::JoinHandle<()>>,
@@ -682,6 +685,7 @@ impl Drop for WaapiClient {
 /// ---
 ///
 /// 同步订阅句柄。**注意：不要在回调内部 drop 本句柄，否则可能死锁。**
+#[derive(Debug)]
 pub struct SubscriptionHandleSync {
     runtime: Arc<tokio::runtime::Runtime>,
     inner: Option<SubscriptionHandle>,
@@ -742,6 +746,7 @@ impl Drop for SubscriptionHandleSync {
 /// ---
 ///
 /// WAAPI 同步客户端。**推荐显式调用 [`disconnect`](WaapiClientSync::disconnect)**。
+#[derive(Debug)]
 pub struct WaapiClientSync {
     runtime: Arc<tokio::runtime::Runtime>,
     client: Option<WaapiClient>,
